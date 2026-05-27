@@ -37,10 +37,8 @@ mod tests {
         fn upgrade(env: Env, new_wasm_hash: BytesN<32>);
         fn get_pow_difficulty(env: Env) -> u32;
         fn get_ip_strength(env: Env, ip_id: u64) -> u32;
-        fn delegate_commitment_authority(env: Env, owner: Address, delegate_address: Address);
-        fn revoke_delegation(env: Env, owner: Address, delegate_address: Address);
-        fn is_delegate(env: Env, owner: Address, delegate_address: Address) -> bool;
-        fn commit_ip_delegated(env: Env, owner: Address, commitment_hash: BytesN<32>, pow_difficulty: u32) -> u64;
+        fn renew_ip(env: Env, ip_id: u64);
+        fn get_renewal_count(env: Env, ip_id: u64) -> u32;
         fn attest_ip(env: Env, ip_id: u64, attestor: Address, attestation_data: soroban_sdk::Bytes);
         fn get_ip_attestations(env: Env, ip_id: u64) -> Vec<crate::Attestation>;
         fn challenge_ip(env: Env, ip_id: u64, challenger: Address, reason: soroban_sdk::Bytes);
@@ -865,63 +863,6 @@ mod tests {
 
         // Strength should be capped at 100
         assert_eq!(strength, 100u32);
-    }
-
-    // ── Tests for Issue #338: IP Commitment Delegation ────────────────────────
-
-    #[test]
-    #[ignore]
-    fn test_delegate_commitment_authority() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let owner = <Address as TestAddress>::generate(&env);
-        let delegate = <Address as TestAddress>::generate(&env);
-
-        client.delegate_commitment_authority(&owner, &delegate);
-
-        let is_delegate = client.is_delegate(&owner, &delegate);
-        assert!(is_delegate);
-    }
-
-    #[test]
-    #[ignore]
-    fn test_revoke_delegation() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let owner = <Address as TestAddress>::generate(&env);
-        let delegate = <Address as TestAddress>::generate(&env);
-
-        client.delegate_commitment_authority(&owner, &delegate);
-        assert!(client.is_delegate(&owner, &delegate));
-
-        client.revoke_delegation(&owner, &delegate);
-        assert!(!client.is_delegate(&owner, &delegate));
-    }
-
-    #[test]
-    #[ignore]
-    fn test_commit_ip_delegated() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let owner = <Address as TestAddress>::generate(&env);
-        let delegate = <Address as TestAddress>::generate(&env);
-        let hash = BytesN::from_array(&env, &[1u8; 32]);
-
-        client.delegate_commitment_authority(&owner, &delegate);
-        let ip_id = client.commit_ip_delegated(&owner, &hash, &0u32);
-
-        let record = client.get_ip(&ip_id);
-        assert_eq!(record.owner, owner);
-        assert_eq!(record.commitment_hash, hash);
     }
 
     // ── Tests for Third-Party Attestations ──
@@ -1825,4 +1766,124 @@ mod tests {
         let expected_topics = (symbol_short!("exp_warn"), ip_id).into_val(&env);
         assert_eq!(event.1, expected_topics);
     }
+
+    // ── Tests for IP Commitment Renewal ─────────────────────────────────────────
+
+    #[test]
+    fn test_renew_ip_extends_ttl_and_increments_counter() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xA1u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        assert_eq!(client.get_renewal_count(&ip_id), 0);
+
+        client.renew_ip(&ip_id);
+        assert_eq!(client.get_renewal_count(&ip_id), 1);
+
+        client.renew_ip(&ip_id);
+        assert_eq!(client.get_renewal_count(&ip_id), 2);
+    }
+
+    #[test]
+    fn test_renew_ip_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xA2u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        client.renew_ip(&ip_id);
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            if let Ok(t) = soroban_sdk::Vec::<soroban_sdk::Val>::try_from_val(&env, &topics) {
+                if let Some(v) = t.get(0) {
+                    if let Ok(s) = soroban_sdk::Symbol::try_from_val(&env, &v) {
+                        return s == soroban_sdk::symbol_short!("renewed");
+                    }
+                }
+            }
+            false
+        });
+        assert!(found, "renewed event must be emitted");
+    }
+
+    #[test]
+    fn test_renew_ip_preserves_commitment_hash_and_owner() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xA3u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+        let before = client.get_ip(&ip_id);
+
+        client.renew_ip(&ip_id);
+
+        let after = client.get_ip(&ip_id);
+        assert_eq!(after.commitment_hash, before.commitment_hash);
+        assert_eq!(after.owner, before.owner);
+        assert_eq!(after.timestamp, before.timestamp);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_renew_ip_nonexistent_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        client.renew_ip(&999u64);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_renew_ip_revoked_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xA4u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+        client.revoke_ip(&ip_id);
+        client.renew_ip(&ip_id);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_renew_ip_requires_owner_auth() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let attacker = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+        let hash = BytesN::from_array(&env, &[0xA5u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "renew_ip",
+                args: (ip_id,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.renew_ip(&ip_id);
+    }
+
 }

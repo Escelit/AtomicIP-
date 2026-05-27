@@ -101,6 +101,17 @@ pub enum DataKey {
     EncryptionKeyRotation(u64), // Issue #434: stores rotation history for a given ip_id
     NotaryPublicKey,        // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
     CommitmentHashes,       // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
+    ShardIps(u32),          // Issue #437: stores Vec<u64> of IP IDs in a given shard
+    CompressedCommitment(u64), // Issue #438: stores BytesN<16> compressed commitment for an IP
+    IpAuditTrail(u64),      // Issue #436: stores Vec<AuditEntry> for an IP
+    IpDisputes(u64),        // stores DisputeRecord for a given dispute_id
+    NextDisputeId,          // monotonic dispute ID counter
+    IpStake(u64),           // Issue #447: stores StakeRecord for an IP
+    OwnerReputation(Address), // Issue #448: stores ReputationRecord for an owner
+    ArbitratorPool,         // Issue #449: stores Vec<Address> of nominated arbitrators
+    ArbitrationCase(u64),   // Issue #449: stores ArbitrationRecord for a given arbitration_id
+    NextArbitrationId,      // Issue #449: monotonic arbitration ID counter
+    RenewalCount(u64),      // number of times an IP commitment has been renewed
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -2742,6 +2753,63 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::ArbitrationCase(arbitration_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::ArbitrationNotFound))
+    }
+
+    // ── Issue: IP Commitment Renewal ───────────────────────────────────────────
+
+    /// Renew an expiring IP commitment by extending its on-chain TTL.
+    ///
+    /// Bumps the storage TTL of the IP record back to `LEDGER_BUMP` ledgers
+    /// without creating a new commitment or changing the commitment hash.
+    /// A renewal counter is incremented on each call.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP does not exist, the caller is not the owner, or the IP
+    /// is revoked.
+    pub fn renew_ip(env: Env, ip_id: u64) {
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+        require_not_revoked(&env, &record);
+
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RenewalCount(ip_id))
+            .unwrap_or(0u32);
+        let new_count = count + 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::RenewalCount(ip_id), &new_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::RenewalCount(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("renewed"), record.owner),
+            (ip_id, new_count),
+        );
+    }
+
+    /// Get the number of times an IP commitment has been renewed.
+    pub fn get_renewal_count(env: Env, ip_id: u64) -> u32 {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::RenewalCount(ip_id))
+            .unwrap_or(0u32)
+    }
+
+            }
+            if Self::is_delegate_in_chain(env, &rec.delegate, candidate, depth + 1) {
+                return true;
+            }
+        }
+        false
     }
 }
 
