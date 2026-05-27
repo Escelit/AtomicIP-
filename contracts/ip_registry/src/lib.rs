@@ -49,6 +49,8 @@ pub enum ContractError {
     InvalidOwnershipPercentage = 14,
     /// #348: Only owner can manage co-owners.
     OnlyOwnerCanManageCoOwners = 15,
+    DisputeNotFound = 16,
+    DisputeAlreadyResolved = 17,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -125,6 +127,18 @@ pub struct IpChallenge {
     pub timestamp: u64,
     pub resolved: bool,
     pub resolution: Bytes,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct DisputeRecord {
+    pub dispute_id: u64,
+    pub ip_id: u64,
+    pub challenger: Address,
+    pub evidence_hash: BytesN<32>,
+    pub timestamp: u64,
+    pub resolved: bool,
+    pub winner: Option<Address>,
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -1865,6 +1879,140 @@ impl IpRegistry {
             results.push_back(result);
         }
         results
+    }
+
+    // ── Dispute Resolution ────────────────────────────────────────────────────
+
+    /// Initiate a dispute against an IP. The challenger must authorize.
+    /// Returns the new dispute ID.
+    pub fn initiate_dispute(
+        env: Env,
+        ip_id: u64,
+        challenger: Address,
+        evidence_hash: BytesN<32>,
+    ) -> u64 {
+        challenger.require_auth();
+        require_ip_exists(&env, ip_id);
+
+        let dispute_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextDisputeId)
+            .unwrap_or(1);
+
+        let record = DisputeRecord {
+            dispute_id,
+            ip_id,
+            challenger: challenger.clone(),
+            evidence_hash,
+            timestamp: env.ledger().timestamp(),
+            resolved: false,
+            winner: None,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpDisputes(dispute_id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpDisputes(dispute_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextDisputeId, &(dispute_id + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextDisputeId, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("dispute"), challenger),
+            (dispute_id, ip_id),
+        );
+
+        dispute_id
+    }
+
+    /// Submit additional evidence for an open dispute. Either the IP owner or
+    /// the challenger may call this. Caller must authorize.
+    pub fn submit_dispute_evidence(
+        env: Env,
+        dispute_id: u64,
+        submitter: Address,
+        evidence_hash: BytesN<32>,
+    ) {
+        submitter.require_auth();
+
+        let mut record: DisputeRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpDisputes(dispute_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound));
+
+        if record.resolved {
+            panic_with_error!(&env, ContractError::DisputeAlreadyResolved);
+        }
+
+        // Only the IP owner or the challenger may submit evidence.
+        let ip_record = require_ip_exists(&env, record.ip_id);
+        if submitter != ip_record.owner && submitter != record.challenger {
+            panic_with_error!(&env, ContractError::Unauthorized);
+        }
+
+        record.evidence_hash = evidence_hash;
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpDisputes(dispute_id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpDisputes(dispute_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("disp_ev"), submitter),
+            dispute_id,
+        );
+    }
+
+    /// Resolve a dispute. Admin-only. Transfers IP ownership to `winner` if
+    /// winner differs from the current owner.
+    pub fn resolve_dispute(env: Env, dispute_id: u64, winner: Address) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+        admin.require_auth();
+
+        let mut record: DisputeRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpDisputes(dispute_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound));
+
+        if record.resolved {
+            panic_with_error!(&env, ContractError::DisputeAlreadyResolved);
+        }
+
+        record.resolved = true;
+        record.winner = Some(winner.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::IpDisputes(dispute_id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::IpDisputes(dispute_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("disp_res"), winner.clone()),
+            (dispute_id, record.ip_id),
+        );
+    }
+
+    /// Get a dispute record by ID.
+    pub fn get_dispute(env: Env, dispute_id: u64) -> DisputeRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::IpDisputes(dispute_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound))
     }
 }
 

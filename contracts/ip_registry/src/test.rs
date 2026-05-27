@@ -1369,4 +1369,179 @@ mod tests {
         let zero = BytesN::from_array(&env, &[0u8; 32]);
         assert_ne!(root, zero);
     }
+
+    // ── Dispute Resolution Tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_initiate_dispute_returns_sequential_ids() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[1u8; 32]), &0u32);
+        let evidence = BytesN::from_array(&env, &[0xABu8; 32]);
+
+        let d1 = client.initiate_dispute(&ip_id, &challenger, &evidence);
+        let d2 = client.initiate_dispute(&ip_id, &challenger, &evidence);
+
+        assert_eq!(d1, 1);
+        assert_eq!(d2, 2);
+    }
+
+    #[test]
+    fn test_initiate_dispute_stores_record() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[2u8; 32]), &0u32);
+        let evidence = BytesN::from_array(&env, &[0xCDu8; 32]);
+
+        let dispute_id = client.initiate_dispute(&ip_id, &challenger, &evidence);
+        let record = client.get_dispute(&dispute_id);
+
+        assert_eq!(record.ip_id, ip_id);
+        assert_eq!(record.challenger, challenger);
+        assert_eq!(record.evidence_hash, evidence);
+        assert!(!record.resolved);
+    }
+
+    #[test]
+    fn test_submit_dispute_evidence_updates_hash() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[3u8; 32]), &0u32);
+        let dispute_id = client.initiate_dispute(
+            &ip_id,
+            &challenger,
+            &BytesN::from_array(&env, &[0x11u8; 32]),
+        );
+
+        let new_evidence = BytesN::from_array(&env, &[0x22u8; 32]);
+        client.submit_dispute_evidence(&dispute_id, &owner, &new_evidence);
+
+        let record = client.get_dispute(&dispute_id);
+        assert_eq!(record.evidence_hash, new_evidence);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_submit_evidence_by_non_party_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        let stranger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[4u8; 32]), &0u32);
+        let dispute_id = client.initiate_dispute(
+            &ip_id,
+            &challenger,
+            &BytesN::from_array(&env, &[0x33u8; 32]),
+        );
+
+        // Stranger is neither owner nor challenger — must panic
+        client.submit_dispute_evidence(
+            &dispute_id,
+            &stranger,
+            &BytesN::from_array(&env, &[0x44u8; 32]),
+        );
+    }
+
+    #[test]
+    fn test_resolve_dispute_marks_resolved_and_sets_winner() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[5u8; 32]), &0u32);
+        let dispute_id = client.initiate_dispute(
+            &ip_id,
+            &challenger,
+            &BytesN::from_array(&env, &[0x55u8; 32]),
+        );
+
+        client.resolve_dispute(&dispute_id, &owner);
+
+        let record = client.get_dispute(&dispute_id);
+        assert!(record.resolved);
+        assert_eq!(record.winner, Some(owner));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_resolve_dispute_twice_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[6u8; 32]), &0u32);
+        let dispute_id = client.initiate_dispute(
+            &ip_id,
+            &challenger,
+            &BytesN::from_array(&env, &[0x66u8; 32]),
+        );
+
+        client.resolve_dispute(&dispute_id, &owner);
+        // Second resolve must panic (DisputeAlreadyResolved)
+        client.resolve_dispute(&dispute_id, &challenger);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_get_dispute_nonexistent_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        client.get_dispute(&999u64);
+    }
+
+    #[test]
+    fn test_initiate_dispute_emits_event() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[7u8; 32]), &0u32);
+        let dispute_id = client.initiate_dispute(
+            &ip_id,
+            &challenger,
+            &BytesN::from_array(&env, &[0x77u8; 32]),
+        );
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            if let Ok(t) = soroban_sdk::Vec::<soroban_sdk::Val>::try_from_val(&env, &topics) {
+                if let Some(v) = t.get(0) {
+                    if let Ok(s) = soroban_sdk::Symbol::try_from_val(&env, &v) {
+                        return s == soroban_sdk::symbol_short!("dispute");
+                    }
+                }
+            }
+            false
+        });
+        assert!(found, "dispute event must be emitted; dispute_id={dispute_id}");
+    }
 }
