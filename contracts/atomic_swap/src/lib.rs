@@ -55,6 +55,7 @@ pub enum ContractError {
     MissingFunc = 30,
     FuncChanged = 31,
     InsufficientReputation = 40,
+    ArbitrationNotTimedOut = 41,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -131,6 +132,8 @@ pub enum DataKey {
     UserReputation(Address),
     /// Maps ip_id → minimum buyer reputation required (set by seller per swap).
     ReputationMultiplier(u64),
+    /// Maps swap_id → timestamp when arbitration was requested.
+    ArbitrationTimestamp(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -152,6 +155,9 @@ pub struct ProtocolConfig {
     pub dispute_window_seconds: u64,
     pub dispute_timeout_secs: u64,
     pub referral_fee_bps: u32,
+    /// How long (seconds) after arbitration is requested before auto-refund is allowed.
+    /// Default: 14 days = 1_209_600 seconds.
+    pub arbitration_timeout_seconds: u64,
 }
 
 #[contracttype]
@@ -1173,6 +1179,7 @@ impl AtomicSwap {
             dispute_window_seconds: 86400,
             dispute_timeout_secs: 604800,
             referral_fee_bps: 100,
+            arbitration_timeout_seconds: 1_209_600, // 14 days
         }
     }
 
@@ -2112,6 +2119,8 @@ impl AtomicSwap {
     // ── #355: Arbitration by Third Party ──────────────────────────────────────
 
     /// Request arbitration for a disputed swap. Buyer or seller only.
+    /// Records the request timestamp so auto-refund can be triggered after
+    /// `arbitration_timeout_seconds` if admin never resolves the dispute.
     pub fn request_arbitration(
         env: Env,
         swap_id: u64,
@@ -2136,6 +2145,17 @@ impl AtomicSwap {
             ContractError::NotDisputed,
         );
 
+        // Record timestamp (only set once — first request wins)
+        if !env.storage().persistent().has(&DataKey::ArbitrationTimestamp(swap_id)) {
+            let ts = env.ledger().timestamp();
+            env.storage()
+                .persistent()
+                .set(&DataKey::ArbitrationTimestamp(swap_id), &ts);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::ArbitrationTimestamp(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+        }
+
         env.events().publish(
             (soroban_sdk::symbol_short!("arb_req"),),
             ArbitrationRequestedEvent {
@@ -2143,6 +2163,56 @@ impl AtomicSwap {
                 requester,
                 evidence_hash,
             },
+        );
+    }
+
+    /// Anyone can call this after `arbitration_timeout_seconds` have elapsed since
+    /// `request_arbitration` was called. If admin has not resolved the dispute by
+    /// then, the buyer is automatically refunded and the swap is cancelled.
+    pub fn auto_refund_on_arbitration_timeout(env: Env, swap_id: u64) {
+        let mut swap = require_swap_exists(&env, swap_id);
+        require_swap_status(&env, &swap, SwapStatus::Disputed, ContractError::NotDisputed);
+
+        let arb_ts: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitrationTimestamp(swap_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NotDisputed as u32,
+                ))
+            });
+
+        let config = Self::protocol_config(&env);
+        let elapsed = env.ledger().timestamp().saturating_sub(arb_ts);
+        if elapsed < config.arbitration_timeout_seconds {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ArbitrationNotTimedOut as u32,
+            ));
+        }
+
+        swap.status = SwapStatus::Cancelled;
+        swap::save_swap(&env, swap_id, &swap);
+        env.storage().persistent().remove(&DataKey::ActiveSwap(swap.ip_id));
+        env.storage().persistent().remove(&DataKey::ArbitrationTimestamp(swap_id));
+
+        // Refund buyer
+        token::Client::new(&env, &swap.token).transfer(
+            &env.current_contract_address(),
+            &swap.buyer,
+            &swap.price,
+        );
+
+        env.storage().persistent().set(
+            &DataKey::CancelReason(swap_id),
+            &Bytes::from_slice(&env, b"arbitration_timeout"),
+        );
+
+        Self::append_history(&env, swap_id, SwapStatus::Cancelled);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("arb_tout"),),
+            DisputeResolvedEvent { swap_id, refunded: true },
         );
     }
 
@@ -2847,3 +2917,6 @@ impl AtomicSwap {
 
 #[cfg(test)]
 mod reputation_tests;
+
+#[cfg(test)]
+mod arbitration_timeout_tests;
