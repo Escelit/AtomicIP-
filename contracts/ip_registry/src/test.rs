@@ -39,6 +39,10 @@ mod tests {
         fn get_ip_strength(env: Env, ip_id: u64) -> u32;
         fn renew_ip(env: Env, ip_id: u64);
         fn get_renewal_count(env: Env, ip_id: u64) -> u32;
+        fn delegate_commitment_authority(env: Env, root_owner: Address, delegator: Address, delegate_address: Address);
+        fn revoke_delegation(env: Env, owner: Address, delegate_address: Address);
+        fn is_delegate(env: Env, owner: Address, delegate_address: Address) -> bool;
+        fn commit_ip_delegated(env: Env, owner: Address, commitment_hash: BytesN<32>, pow_difficulty: u32) -> u64;
         fn attest_ip(env: Env, ip_id: u64, attestor: Address, attestation_data: soroban_sdk::Bytes);
         fn get_ip_attestations(env: Env, ip_id: u64) -> Vec<crate::Attestation>;
         fn challenge_ip(env: Env, ip_id: u64, challenger: Address, reason: soroban_sdk::Bytes);
