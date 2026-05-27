@@ -99,23 +99,8 @@ pub enum DataKey {
     OwnershipChallenge(u64), // Issue #433: stores OwnershipChallenge for a given challenge_id
     NextChallengeId,         // Issue #433: monotonic challenge ID counter
     EncryptionKeyRotation(u64), // Issue #434: stores rotation history for a given ip_id
-    // Issue #436: immutable audit trail per IP
-    IpAuditTrail(u64),
-    // Issue #437: shard -> Vec<u64> of IP IDs
-    ShardIps(u32),
-    // Issue #438: compressed (16-byte) commitment per IP
-    CompressedCommitment(u64),
-    // Dispute resolution
-    IpDisputes(u64),
-    NextDisputeId,
-    // Issue #447: staking
-    IpStake(u64),
-    // Issue #448: reputation
-    OwnerReputation(Address),
-    // Issue #449: arbitration
-    ArbitratorPool,
-    ArbitrationCase(u64),
-    NextArbitrationId,
+    NotaryPublicKey,        // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
+    CommitmentHashes,       // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -1306,6 +1291,27 @@ impl IpRegistry {
         Self::create_ip_version(env, parent_ip_id, commitment_hash)
     }
 
+    /// Get all direct child version IDs for a given IP.
+    ///
+    /// Returns the IDs of all IPs that were created as direct versions of `ip_id`
+    /// via `create_ip_version` or `commit_ip_version`. Does not include
+    /// grandchildren or deeper descendants.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<u64>` of direct child version IDs, or an empty vec if none exist.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP record does not exist (IpNotFound error).
+    pub fn get_ip_versions(env: Env, ip_id: u64) -> Vec<u64> {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::IpVersions(ip_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
     /// Retrieve the full version chain for an IP, rooted at the original.
     ///
     /// Returns a `Vec<u64>` starting with the root IP ID followed by all
@@ -1616,14 +1622,75 @@ impl IpRegistry {
             .unwrap_or(Vec::new(&env))
     }
 
-    // ── Issue #345: Timestamp Notarization ─────────────────────────────────────
+    // ── Issue #345 / #428: Timestamp Notarization ──────────────────────────────
 
-    /// Notarize an IP timestamp with a notary signature. Notary-only.
+    /// Set the trusted notary public key (Ed25519, 32 bytes). Admin-only.
+    ///
+    /// Must be called once after deployment to configure the notary public key
+    /// used to verify timestamp signatures.
+    pub fn set_notary_public_key(env: Env, public_key: BytesN<32>) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| env.current_contract_address());
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::NotaryPublicKey, &public_key);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NotaryPublicKey, LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Notarize an IP timestamp with a notary Ed25519 signature.
+    ///
+    /// The notary must sign the message `ip_id_be_bytes || timestamp_be_bytes`
+    /// (8 bytes each, big-endian) with the private key corresponding to the
+    /// stored notary public key. The 64-byte signature is verified on-chain.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The IP does not exist (IpNotFound error)
+    /// * The notary public key has not been set (Unauthorized error)
+    /// * The signature is not exactly 64 bytes (Unauthorized error)
+    /// * The Ed25519 signature verification fails (Unauthorized error)
     pub fn notarize_ip_timestamp(env: Env, ip_id: u64, notary_signature: Bytes) {
         let mut record = require_ip_exists(&env, ip_id);
 
-        // In production, verify notary_signature against NOTARY_PUBLIC_KEY
-        // For now, accept any signature (placeholder implementation)
+        // Require notary public key to be configured
+        let public_key: BytesN<32> = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::NotaryPublicKey)
+        {
+            Some(k) => k,
+            None => {
+                env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
+            }
+        };
+
+        // Signature must be exactly 64 bytes for Ed25519
+        if notary_signature.len() != 64 {
+            env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
+        }
+        let sig: BytesN<64> = match notary_signature.clone().try_into() {
+            Ok(s) => s,
+            Err(_) => {
+                env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
+            }
+        };
+
+        // Message: ip_id (8 bytes BE) || timestamp (8 bytes BE)
+        let mut message = Bytes::new(&env);
+        message.append(&Bytes::from_array(&env, &ip_id.to_be_bytes()));
+        message.append(&Bytes::from_array(&env, &record.timestamp.to_be_bytes()));
+
+        // Verify Ed25519 signature — panics if invalid
+        env.crypto().ed25519_verify(&public_key, &message, &sig);
+
         record.notary_signature = Some(notary_signature.clone());
 
         env.storage()
@@ -1670,26 +1737,61 @@ impl IpRegistry {
 
     // get_ip_disputes removed - IpDisputes DataKey variant not defined
 
-    // ── Issue #346: Commitment Rollback Protection ─────────────────────────────
+    // ── Issue #346 / #429: Commitment Rollback Protection ─────────────────────
 
     /// Compute and store a checksum of all commitments for rollback protection.
+    ///
+    /// Appends the latest commitment hash to the tracked list, then recomputes
+    /// the checksum as sha256 of all concatenated commitment hashes.
     fn update_commitment_checksum(env: &Env) {
-        // Get all commitment hashes from storage
-        // For simplicity, we compute a hash of all commitment hashes
-        let all_hashes = Bytes::new(env);
-
-        // This is a simplified implementation - in production, you'd iterate through all IPs
-        // For now, we'll store a placeholder checksum
-        let checksum: BytesN<32> = env.crypto().sha256(&all_hashes).into();
-
-        env.storage()
+        // Retrieve the current next ID to find the most recently added commitment
+        let next_id: u64 = env
+            .storage()
             .persistent()
-            .set(&DataKey::IpCommitmentChecksum, &checksum);
-        env.storage().persistent().extend_ttl(
-            &DataKey::IpCommitmentChecksum,
-            LEDGER_BUMP,
-            LEDGER_BUMP,
-        );
+            .get(&DataKey::NextId)
+            .unwrap_or(1);
+
+        // The last committed IP ID is next_id - 1 (if any IPs exist)
+        if next_id <= 1 {
+            return;
+        }
+        let last_id = next_id - 1;
+
+        // Get the commitment hash of the last committed IP
+        let last_record: Option<IpRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpRecord(last_id));
+
+        if let Some(record) = last_record {
+            // Append to tracked commitment hashes list
+            let mut hashes: Vec<BytesN<32>> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::CommitmentHashes)
+                .unwrap_or(Vec::new(env));
+            hashes.push_back(record.commitment_hash);
+            env.storage()
+                .persistent()
+                .set(&DataKey::CommitmentHashes, &hashes);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::CommitmentHashes, LEDGER_BUMP, LEDGER_BUMP);
+
+            // Recompute checksum: sha256 of all concatenated commitment hashes
+            let mut all_bytes = Bytes::new(env);
+            for h in hashes.iter() {
+                all_bytes.append(&h.into());
+            }
+            let checksum: BytesN<32> = env.crypto().sha256(&all_bytes).into();
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::IpCommitmentChecksum, &checksum);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::IpCommitmentChecksum, LEDGER_BUMP, LEDGER_BUMP);
+        }
     }
 
     // ── Issue #439: Commitment Deduplication ──────────────────────────────────
@@ -1875,22 +1977,81 @@ impl IpRegistry {
     }
 
     /// Verify the integrity of all commitments (for upgrade safety).
+    ///
+    /// Recomputes the checksum from the tracked commitment hashes list and
+    /// compares it to the stored checksum. Returns `true` if they match.
     pub fn verify_commitment_integrity(env: Env) -> bool {
-        // Retrieve stored checksum
         let stored_checksum: Option<BytesN<32>> = env
             .storage()
             .persistent()
             .get(&DataKey::IpCommitmentChecksum);
 
         if stored_checksum.is_none() {
-            return true; // No checksum stored yet
+            return true; // No checksum stored yet — nothing to verify
         }
 
-        // Recompute checksum
-        let all_hashes = Bytes::new(&env);
-        let recomputed_checksum: BytesN<32> = env.crypto().sha256(&all_hashes).into();
+        let hashes: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommitmentHashes)
+            .unwrap_or(Vec::new(&env));
 
-        stored_checksum.unwrap() == recomputed_checksum
+        let mut all_bytes = Bytes::new(&env);
+        for h in hashes.iter() {
+            all_bytes.append(&h.into());
+        }
+        let recomputed: BytesN<32> = env.crypto().sha256(&all_bytes).into();
+
+        stored_checksum.unwrap() == recomputed
+    }
+
+    // ── Issue #431: IP Claim Expiration Warnings ───────────────────────────────
+
+    /// Check if an IP commitment is approaching expiration and emit a warning event.
+    ///
+    /// Compares the remaining TTL of the IP record against `warning_threshold_ledgers`.
+    /// If the remaining TTL is less than or equal to the threshold, emits an
+    /// `exp_warn` event and returns `true`. Otherwise returns `false`.
+    ///
+    /// The TTL is estimated as `LEDGER_BUMP` minus ledgers elapsed since commitment
+    /// (using ledger sequence numbers as a proxy).
+    ///
+    /// # Arguments
+    ///
+    /// * `ip_id` - The IP to check
+    /// * `warning_threshold_ledgers` - Warn if remaining TTL ≤ this many ledgers
+    ///
+    /// # Returns
+    ///
+    /// `true` if the IP is approaching expiration, `false` otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP record does not exist (IpNotFound error).
+    pub fn check_expiration_warning(env: Env, ip_id: u64, warning_threshold_ledgers: u32) -> bool {
+        let record = require_ip_exists(&env, ip_id);
+
+        // Estimate remaining TTL: LEDGER_BUMP minus ledgers elapsed since commit.
+        // We use ledger sequence as a proxy for elapsed time.
+        // The record was committed at some ledger; we stored LEDGER_BUMP TTL at that point.
+        // Current sequence - commit sequence ≈ ledgers elapsed.
+        // Since we don't store the commit ledger sequence, we use timestamp difference
+        // as a proxy: elapsed_seconds / 5 ≈ elapsed_ledgers (5s per ledger).
+        let current_timestamp = env.ledger().timestamp();
+        let commit_timestamp = record.timestamp;
+        let elapsed_seconds = current_timestamp.saturating_sub(commit_timestamp);
+        let elapsed_ledgers = (elapsed_seconds / 5) as u32;
+        let remaining_ttl = LEDGER_BUMP.saturating_sub(elapsed_ledgers);
+
+        if remaining_ttl <= warning_threshold_ledgers {
+            env.events().publish(
+                (symbol_short!("exp_warn"), ip_id),
+                (record.owner, remaining_ttl),
+            );
+            return true;
+        }
+
+        false
     }
 
     // ── Issue #433: IP Ownership Proof Challenge ───────────────────────────────
