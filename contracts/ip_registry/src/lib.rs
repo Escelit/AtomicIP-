@@ -1513,6 +1513,38 @@ impl IpRegistry {
 
         stored_checksum.unwrap() == recomputed_checksum
     }
+
+    // ── Issue #432: Batch Commitment Verification ──────────────────────────────
+
+    /// Verify multiple IP commitments in a single call to reduce gas costs.
+    ///
+    /// Each entry is a tuple of (ip_id, secret, blinding_factor). Returns a
+    /// Vec<bool> in the same order — `true` if the commitment matches, `false` otherwise.
+    /// Non-existent IPs return `false` rather than panicking.
+    pub fn batch_verify_commitments(
+        env: Env,
+        verifications: Vec<(u64, BytesN<32>, BytesN<32>)>,
+    ) -> Vec<bool> {
+        let mut results = Vec::new(&env);
+        for entry in verifications.iter() {
+            let (ip_id, secret, blinding_factor) = entry;
+            let result = if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, IpRecord>(&DataKey::IpRecord(ip_id))
+            {
+                let mut preimage = Bytes::new(&env);
+                preimage.append(&secret.into());
+                preimage.append(&blinding_factor.into());
+                let computed: BytesN<32> = env.crypto().sha256(&preimage).into();
+                record.commitment_hash == computed
+            } else {
+                false
+            };
+            results.push_back(result);
+        }
+        results
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

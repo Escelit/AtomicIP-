@@ -46,6 +46,8 @@ mod tests {
         fn challenge_ip(env: Env, ip_id: u64, challenger: Address, reason: soroban_sdk::Bytes);
         fn get_ip_disputes(env: Env, ip_id: u64) -> Vec<crate::IpChallenge>;
         fn commit_ip_version(env: Env, owner: Address, commitment_hash: BytesN<32>, parent_ip_id: u64) -> u64;
+        // Issue #432
+        fn batch_verify_commitments(env: Env, verifications: Vec<(u64, BytesN<32>, BytesN<32>)>) -> Vec<bool>;
     }
 
     #[test]
@@ -1057,5 +1059,83 @@ mod tests {
             &challenger,
             &soroban_sdk::Bytes::from_array(&env, &[1u8; 32]),
         );
+    }
+
+    // ── Issue #432: Batch Commitment Verification ──────────────────────────────
+
+    #[test]
+    fn test_batch_verify_commitments_all_valid() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+
+        let secret1 = BytesN::from_array(&env, &[0x11u8; 32]);
+        let bf1 = BytesN::from_array(&env, &[0x12u8; 32]);
+        let mut pre1 = soroban_sdk::Bytes::new(&env);
+        pre1.append(&secret1.clone().into());
+        pre1.append(&bf1.clone().into());
+        let hash1: BytesN<32> = env.crypto().sha256(&pre1).into();
+
+        let secret2 = BytesN::from_array(&env, &[0x21u8; 32]);
+        let bf2 = BytesN::from_array(&env, &[0x22u8; 32]);
+        let mut pre2 = soroban_sdk::Bytes::new(&env);
+        pre2.append(&secret2.clone().into());
+        pre2.append(&bf2.clone().into());
+        let hash2: BytesN<32> = env.crypto().sha256(&pre2).into();
+
+        let id1 = client.commit_ip(&owner, &hash1, &0u32);
+        let id2 = client.commit_ip(&owner, &hash2, &0u32);
+
+        let mut verifications: Vec<(u64, BytesN<32>, BytesN<32>)> = Vec::new(&env);
+        verifications.push_back((id1, secret1, bf1));
+        verifications.push_back((id2, secret2, bf2));
+
+        let results = client.batch_verify_commitments(&verifications);
+        assert_eq!(results.len(), 2);
+        assert!(results.get(0).unwrap());
+        assert!(results.get(1).unwrap());
+    }
+
+    #[test]
+    fn test_batch_verify_commitments_invalid_secret() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let secret = BytesN::from_array(&env, &[0xAAu8; 32]);
+        let bf = BytesN::from_array(&env, &[0xBBu8; 32]);
+        let mut pre = soroban_sdk::Bytes::new(&env);
+        pre.append(&secret.clone().into());
+        pre.append(&bf.clone().into());
+        let hash: BytesN<32> = env.crypto().sha256(&pre).into();
+        let id = client.commit_ip(&owner, &hash, &0u32);
+
+        let wrong_secret = BytesN::from_array(&env, &[0xFFu8; 32]);
+        let mut verifications: Vec<(u64, BytesN<32>, BytesN<32>)> = Vec::new(&env);
+        verifications.push_back((id, wrong_secret, bf));
+
+        let results = client.batch_verify_commitments(&verifications);
+        assert!(!results.get(0).unwrap());
+    }
+
+    #[test]
+    fn test_batch_verify_nonexistent_ip_returns_false() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let secret = BytesN::from_array(&env, &[0x01u8; 32]);
+        let bf = BytesN::from_array(&env, &[0x02u8; 32]);
+        let mut verifications: Vec<(u64, BytesN<32>, BytesN<32>)> = Vec::new(&env);
+        verifications.push_back((999u64, secret, bf));
+
+        let results = client.batch_verify_commitments(&verifications);
+        assert!(!results.get(0).unwrap());
     }
 }
