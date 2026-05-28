@@ -1201,6 +1201,7 @@ impl AtomicSwap {
                 dispute_window_seconds,
                 dispute_timeout_secs,
                 referral_fee_bps,
+                arbitration_timeout_seconds: 1_209_600,
             },
         );
     }
@@ -2283,7 +2284,7 @@ impl AtomicSwap {
     /// Anyone can call this after `arbitration_timeout_seconds` have elapsed since
     /// `request_arbitration` was called. If admin has not resolved the dispute by
     /// then, the buyer is automatically refunded and the swap is cancelled.
-    pub fn auto_refund_on_arbitration_timeout(env: Env, swap_id: u64) {
+    pub fn auto_refund_timeout(env: Env, swap_id: u64) {
         let mut swap = require_swap_exists(&env, swap_id);
         require_swap_status(&env, &swap, SwapStatus::Disputed, ContractError::NotDisputed);
 
@@ -2907,7 +2908,7 @@ impl AtomicSwap {
                 price,
                 token: token.clone(),
                 status: SwapStatus::Pending,
-                expiry: *timeout,
+                expiry: timeout,
                 accept_timestamp: 0,
                 required_approvals: 0,
                 dispute_timestamp: 0,
@@ -2918,6 +2919,8 @@ impl AtomicSwap {
                 escrow_agent: None,
                 quantity: 1,
                 conditions: Vec::new(&env),
+                paid_amount: 0,
+                is_installment: false,
             };
 
             env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -3160,6 +3163,8 @@ impl AtomicSwap {
             escrow_agent: None,
             quantity: 1,
             conditions: Vec::new(&env),
+            paid_amount: 0,
+            is_installment: false,
         };
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -3319,15 +3324,15 @@ impl AtomicSwap {
 #[cfg(test)]
 mod installment_tests {
     use super::*;
-    use soroban_sdk::{Address, Env, Vec};
+    use soroban_sdk::{testutils::Address as TestAddress, Env, Vec};
 
     fn make_swap(env: &Env, price: i128, paid: i128, is_installment: bool) -> SwapRecord {
         SwapRecord {
             ip_id: 1,
-            seller: Address::generate(env),
-            buyer: Address::generate(env),
+            seller: <soroban_sdk::Address as TestAddress>::generate(env),
+            buyer: <soroban_sdk::Address as TestAddress>::generate(env),
             price,
-            token: Address::generate(env),
+            token: <soroban_sdk::Address as TestAddress>::generate(env),
             status: SwapStatus::Pending,
             expiry: 9_999_999,
             accept_timestamp: 0,
