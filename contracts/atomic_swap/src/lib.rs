@@ -54,6 +54,7 @@ pub enum ContractError {
     SchemaNotGreater = 29,
     MissingFunc = 30,
     FuncChanged = 31,
+    InsufficientReputation = 40,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -126,6 +127,10 @@ pub enum DataKey {
     SwapMode(u64),
     /// Escrow: maps swap_id → deposited amount (set when buyer deposits).
     EscrowDeposit(u64),
+    /// Maps address → reputation score (0–100).
+    UserReputation(Address),
+    /// Maps ip_id → minimum buyer reputation required (set by seller per swap).
+    ReputationMultiplier(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -395,6 +400,24 @@ impl AtomicSwap {
             Self::evaluate_conditions(&env, &swap);
         }
 
+        // Check minimum reputation requirement set by seller
+        if let Some(min_rep) = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::ReputationMultiplier(swap_id))
+        {
+            let buyer_rep = env
+                .storage()
+                .persistent()
+                .get::<_, u32>(&DataKey::UserReputation(swap.buyer.clone()))
+                .unwrap_or(50u32);
+            if buyer_rep < min_rep {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::InsufficientReputation as u32,
+                ));
+            }
+        }
+
         // #350: Deposit collateral if required
         if swap.collateral_amount > 0 {
             // Check if collateral already deposited
@@ -602,7 +625,8 @@ impl AtomicSwap {
         }
 
         // #359: Update reputation on completion
-        // reputation::update_reputation_on_completion(&env, &swap.seller, &swap.buyer);
+        Self::update_reputation(&env, &swap.seller, 5);
+        Self::update_reputation(&env, &swap.buyer, 5);
 
         env.events().publish(
             (soroban_sdk::symbol_short!("key_rev"),),
@@ -962,6 +986,9 @@ impl AtomicSwap {
         // #253: Log history entry
         Self::append_history(&env, swap_id, SwapStatus::Cancelled);
 
+        // Update reputation: canceller loses 10 points
+        Self::update_reputation(&env, &canceller, -10);
+
         env.events().publish(
             (soroban_sdk::symbol_short!("swap_cncl"),),
             SwapCancelledEvent { swap_id, canceller },
@@ -1025,6 +1052,9 @@ impl AtomicSwap {
 
         // #253: Log history entry
         Self::append_history(&env, swap_id, SwapStatus::Cancelled);
+
+        // Seller defaulted (expired without revealing key): seller loses 10 points
+        Self::update_reputation(&env, &swap.seller, -10);
 
         env.events().publish(
             (soroban_sdk::symbol_short!("s_cancel"),),
@@ -2824,6 +2854,47 @@ impl AtomicSwap {
             (soroban_sdk::symbol_short!("esc_wdr"),),
             SwapCancelledEvent { swap_id, canceller: swap.buyer },
         );
+    }
+
+    // ── Reputation ────────────────────────────────────────────────────────────
+
+    /// Returns the reputation score (0–100) for an address. Defaults to 50.
+    pub fn get_reputation(env: Env, address: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserReputation(address))
+            .unwrap_or(50u32)
+    }
+
+    /// Seller sets a minimum buyer reputation required for a specific swap.
+    /// Must be called by the swap's seller before the buyer accepts.
+    pub fn set_reputation_multiplier(env: Env, swap_id: u64, min_reputation: u32) {
+        let swap = require_swap_exists(&env, swap_id);
+        swap.seller.require_auth();
+        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReputationMultiplier(swap_id), &min_reputation);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ReputationMultiplier(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Internal: adjust reputation score, clamped to [0, 100].
+    fn update_reputation(env: &Env, address: &Address, delta: i32) {
+        let current: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserReputation(address.clone()))
+            .unwrap_or(50u32);
+        let updated = (current as i32).saturating_add(delta).clamp(0, 100) as u32;
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserReputation(address.clone()), &updated);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::UserReputation(address.clone()), LEDGER_BUMP, LEDGER_BUMP);
     }
 }
 
