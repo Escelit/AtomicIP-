@@ -5,12 +5,15 @@ target/
 
 # Environment secrets
 .env
+.env.local
+.env.*.local
 
 # Editor/IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*.orig
 
 # OS
 .DS_Store
@@ -19,3 +22,23 @@ Thumbs.db
 # Fuzz artifacts
 fuzz/artifacts/
 fuzz/corpus/*/crashes/
+fuzz/corpus/*/queue/
+fuzz/corpus/*/hangs/
+
+# Soroban build artifacts
+*.wasm
+*.optimized.wasm
+
+# Node / client
+node_modules/
+client/node_modules/
+client/dist/
+client/.openapi-generator/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Coverage
+lcov.info
+coverage/
