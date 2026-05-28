@@ -54,6 +54,8 @@ pub enum ContractError {
     SchemaNotGreater = 29,
     MissingFunc = 30,
     FuncChanged = 31,
+    /// #468: A swap condition was not satisfied at completion time.
+    ConditionNotMet = 58,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -333,11 +335,15 @@ impl AtomicSwap {
     }
 
     /// Evaluate all conditions on a swap. Panics with ConditionNotMet if any fail.
-    fn evaluate_conditions(env: &Env, swap: &SwapRecord) {
+    /// `check_key_valid` controls whether KeyValid is enforced (true at reveal_key time).
+    fn evaluate_conditions(env: &Env, swap: &SwapRecord, check_key_valid: bool) {
         for i in 0..swap.conditions.len() {
             let ok = match swap.conditions.get(i).unwrap() {
                 SwapCondition::KeyValid => {
-                    // KeyValid is enforced at reveal_key; always passes at accept time.
+                    // At reveal_key time (check_key_valid=true) the key has already been
+                    // verified by registry::verify_commitment, so this always passes.
+                    // At accept time (check_key_valid=false) this is deferred.
+                    let _ = check_key_valid;
                     true
                 }
                 SwapCondition::PriceBelow(threshold) => swap.price < threshold,
@@ -345,15 +351,60 @@ impl AtomicSwap {
             };
             if !ok {
                 env.panic_with_error(Error::from_contract_error(
-                    ContractError::NotExpired as u32,
+                    ContractError::ConditionNotMet as u32,
                 ));
             }
         }
     }
 
-    /// Buyer accepts the swap with conditions. Conditions are stored on the swap record
-    /// and evaluated immediately. If all pass, the swap proceeds to Accepted.
-        // accept_swap_conditional removed - conditions field not in SwapRecord
+    /// #468: Buyer accepts the swap with conditions. Conditions are stored on the swap
+    /// record and evaluated immediately (except KeyValid, which is deferred to reveal_key).
+    /// If all non-deferred conditions pass, the swap proceeds to Accepted.
+    pub fn accept_swap_conditional(env: Env, swap_id: u64, conditions: Vec<SwapCondition>) {
+        require_not_paused(&env);
+
+        let mut swap = require_swap_exists(&env, swap_id);
+        swap.buyer.require_auth();
+        require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+
+        // #254: Ensure all required approvals have been collected.
+        if swap.required_approvals > 0 {
+            let approvals: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SwapApprovals(swap_id))
+                .unwrap_or(Vec::new(&env));
+            if (approvals.len() as u32) < swap.required_approvals {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NeedApprovals as u32,
+                ));
+            }
+        }
+
+        // Attach conditions to the swap record.
+        swap.conditions = conditions;
+
+        // Evaluate non-deferred conditions immediately.
+        Self::evaluate_conditions(&env, &swap, false);
+
+        // Transfer payment from buyer into contract escrow.
+        token::Client::new(&env, &swap.token).transfer(
+            &swap.buyer,
+            &env.current_contract_address(),
+            &swap.price,
+        );
+
+        swap.accept_timestamp = env.ledger().timestamp();
+        swap.status = SwapStatus::Accepted;
+        swap::save_swap(&env, swap_id, &swap);
+
+        Self::append_history(&env, swap_id, SwapStatus::Accepted);
+
+        env.events().publish(
+            (symbol_short!("swap_acpt"),),
+            SwapAcceptedEvent { swap_id, buyer: swap.buyer },
+        );
+    }
 
     /// Buyer accepts the swap.
     pub fn accept_swap(env: Env, swap_id: u64) {
@@ -386,7 +437,7 @@ impl AtomicSwap {
 
         // #351: Evaluate any buyer-set conditions.
         if !swap.conditions.is_empty() {
-            Self::evaluate_conditions(&env, &swap);
+            Self::evaluate_conditions(&env, &swap, false);
         }
 
         // #350: Deposit collateral if required
@@ -492,6 +543,14 @@ impl AtomicSwap {
                     .extend_ttl(&DataKey::InsuranceClaimable(swap_id), LEDGER_BUMP, LEDGER_BUMP);
             }
             env.panic_with_error(Error::from_contract_error(ContractError::InvalidKey as u32));
+        }
+
+        // #468: Enforce KeyValid condition — if the swap has a KeyValid condition,
+        // the key must have been verified above. Since we only reach here when valid=true,
+        // this is always satisfied; but we also re-evaluate all other conditions at
+        // reveal time to ensure time/price conditions still hold.
+        if !swap.conditions.is_empty() {
+            Self::evaluate_conditions(&env, &swap, true);
         }
 
         swap.status = SwapStatus::Completed;
@@ -2773,3 +2832,6 @@ impl AtomicSwap {
 
 // #[cfg(test)]
 // mod upgrade_chaos_tests;
+
+#[cfg(test)]
+mod conditional_tests;
