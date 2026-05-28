@@ -1636,6 +1636,17 @@ impl AtomicSwap {
             swap_ids.push_back(id);
         }
 
+        // #519: Emit batch-level initiated event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("btch_ini"),),
+            BatchInitiatedEvent {
+                swap_ids: swap_ids.clone(),
+                seller,
+                buyer,
+                count: len as u32,
+            },
+        );
+
         swap_ids
     }
 
