@@ -19,3 +19,6 @@ Thumbs.db
 # Fuzz artifacts
 fuzz/artifacts/
 fuzz/corpus/*/crashes/
+
+# Project issues file
+vrickish.md
