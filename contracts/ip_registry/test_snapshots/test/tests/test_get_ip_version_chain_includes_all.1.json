@@ -18,7 +18,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "bytes": "1010101010101010101010101010101010101010101010101010101010101010"
+                  "bytes": "4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c"
                 },
                 {
                   "u32": 0
@@ -37,41 +37,39 @@
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "function_name": "commit_ip",
+              "function_name": "commit_ip_version",
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "bytes": "1111111111111111111111111111111111111111111111111111111111111111"
+                  "bytes": "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
                 },
                 {
-                  "u32": 0
+                  "u64": 1
                 }
               ]
             }
           },
           "sub_invocations": []
         }
-      ]
-    ],
-    [
+      ],
       [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
         {
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "function_name": "commit_ip",
+              "function_name": "commit_ip_version",
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "bytes": "1212121212121212121212121212121212121212121212121212121212121212"
+                  "bytes": "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
                 },
                 {
-                  "u32": 0
+                  "u64": 1
                 }
               ]
             }
@@ -163,13 +161,7 @@
                 "val": {
                   "vec": [
                     {
-                      "bytes": "1010101010101010101010101010101010101010101010101010101010101010"
-                    },
-                    {
-                      "bytes": "1111111111111111111111111111111111111111111111111111111111111111"
-                    },
-                    {
-                      "bytes": "1212121212121212121212121212121212121212121212121212121212121212"
+                      "bytes": "4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c"
                     }
                   ]
                 }
@@ -190,7 +182,7 @@
                   "symbol": "CommitmentOwner"
                 },
                 {
-                  "bytes": "1010101010101010101010101010101010101010101010101010101010101010"
+                  "bytes": "4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c"
                 }
               ]
             },
@@ -210,7 +202,7 @@
                       "symbol": "CommitmentOwner"
                     },
                     {
-                      "bytes": "1010101010101010101010101010101010101010101010101010101010101010"
+                      "bytes": "4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c"
                     }
                   ]
                 },
@@ -235,7 +227,7 @@
                   "symbol": "CommitmentOwner"
                 },
                 {
-                  "bytes": "1111111111111111111111111111111111111111111111111111111111111111"
+                  "bytes": "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
                 }
               ]
             },
@@ -255,52 +247,7 @@
                       "symbol": "CommitmentOwner"
                     },
                     {
-                      "bytes": "1111111111111111111111111111111111111111111111111111111111111111"
-                    }
-                  ]
-                },
-                "durability": "persistent",
-                "val": {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                }
-              }
-            },
-            "ext": "v0"
-          },
-          6307200
-        ]
-      ],
-      [
-        {
-          "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "key": {
-              "vec": [
-                {
-                  "symbol": "CommitmentOwner"
-                },
-                {
-                  "bytes": "1212121212121212121212121212121212121212121212121212121212121212"
-                }
-              ]
-            },
-            "durability": "persistent"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-                "key": {
-                  "vec": [
-                    {
-                      "symbol": "CommitmentOwner"
-                    },
-                    {
-                      "bytes": "1212121212121212121212121212121212121212121212121212121212121212"
+                      "bytes": "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
                     }
                   ]
                 },
@@ -345,7 +292,7 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "bytes": "49123fe33eb96ec648e137640414dc361e3b86fa26c0f479d10ae5038bd07b63"
+                  "bytes": "4be3e71945f328b2a03b3ca5015f49d9a9300aacba6e25276c1bf08fba68f3f3"
                 }
               }
             },
@@ -404,7 +351,7 @@
                         "symbol": "commitment_hash"
                       },
                       "val": {
-                        "bytes": "1010101010101010101010101010101010101010101010101010101010101010"
+                        "bytes": "4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c"
                       }
                     },
                     {
@@ -510,7 +457,7 @@
                         "symbol": "commitment_hash"
                       },
                       "val": {
-                        "bytes": "1111111111111111111111111111111111111111111111111111111111111111"
+                        "bytes": "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
                       }
                     },
                     {
@@ -539,7 +486,9 @@
                       "key": {
                         "symbol": "parent_ip_id"
                       },
-                      "val": "void"
+                      "val": {
+                        "u64": 1
+                      }
                     },
                     {
                       "key": {
@@ -573,10 +522,10 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "IpRecord"
+                  "symbol": "IpVersionChain"
                 },
                 {
-                  "u64": 3
+                  "u64": 1
                 }
               ]
             },
@@ -593,75 +542,70 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "IpRecord"
+                      "symbol": "IpVersionChain"
                     },
                     {
-                      "u64": 3
+                      "u64": 1
                     }
                   ]
                 },
                 "durability": "persistent",
                 "val": {
-                  "map": [
+                  "vec": [
                     {
-                      "key": {
-                        "symbol": "co_owners"
-                      },
-                      "val": {
-                        "vec": []
-                      }
+                      "u64": 1
                     },
                     {
-                      "key": {
-                        "symbol": "commitment_hash"
-                      },
-                      "val": {
-                        "bytes": "1212121212121212121212121212121212121212121212121212121212121212"
-                      }
+                      "u64": 2
+                    }
+                  ]
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          6307200
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "IpVersions"
+                },
+                {
+                  "u64": 1
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "IpVersions"
                     },
                     {
-                      "key": {
-                        "symbol": "ip_id"
-                      },
-                      "val": {
-                        "u64": 3
-                      }
-                    },
+                      "u64": 1
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "vec": [
                     {
-                      "key": {
-                        "symbol": "notary_signature"
-                      },
-                      "val": "void"
-                    },
-                    {
-                      "key": {
-                        "symbol": "owner"
-                      },
-                      "val": {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "parent_ip_id"
-                      },
-                      "val": "void"
-                    },
-                    {
-                      "key": {
-                        "symbol": "revoked"
-                      },
-                      "val": {
-                        "bool": false
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "timestamp"
-                      },
-                      "val": {
-                        "u64": 0
-                      }
+                      "u64": 2
                     }
                   ]
                 }
@@ -702,7 +646,7 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "u64": 4
+                  "u64": 3
                 }
               }
             },
@@ -753,9 +697,6 @@
                     },
                     {
                       "u64": 2
-                    },
-                    {
-                      "u64": 3
                     }
                   ]
                 }

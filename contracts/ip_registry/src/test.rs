@@ -60,6 +60,14 @@ mod tests {
         fn generate_merkle_proof(env: Env, ip_id: u64) -> Vec<BytesN<32>>;
         fn compute_ip_merkle_root(env: Env, owner: Address) -> BytesN<32>;
         fn verify_ip_merkle_proof(env: Env, ip_id: u64, proof: Vec<BytesN<32>>) -> bool;
+        fn set_notary_public_key(env: Env, public_key: BytesN<32>);
+        fn notarize_ip_timestamp(env: Env, ip_id: u64, notary_signature: soroban_sdk::Bytes);
+        fn get_ip_notary_signature(env: Env, ip_id: u64) -> Option<soroban_sdk::Bytes>;
+        fn verify_commitment_integrity(env: Env) -> bool;
+        fn get_ip_versions(env: Env, ip_id: u64) -> Vec<u64>;
+        fn get_ip_lineage(env: Env, ip_id: u64) -> Vec<u64>;
+        fn get_ip_version_chain(env: Env, ip_id: u64) -> Vec<u64>;
+        fn check_expiration_warning(env: Env, ip_id: u64, warning_threshold_ledgers: u32) -> bool;
     }
 
     #[test]
@@ -1073,10 +1081,12 @@ mod tests {
         );
     }
 
-    // ── Issue #432: Batch Commitment Verification ──────────────────────────────
+    // ── Tests for Issue #428: Commitment Timestamp Notarization ──────────────
 
     #[test]
-    fn test_batch_verify_commitments_all_valid() {
+    fn test_notarize_ip_timestamp_with_valid_signature() {
+        use ed25519_dalek::{Signer, SigningKey};
+
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(crate::IpRegistry, ());
@@ -1163,29 +1173,23 @@ mod tests {
         let owner = <Address as TestAddress>::generate(&env);
         let challenger = <Address as TestAddress>::generate(&env);
 
-        // Commit an IP
         let hash = BytesN::from_array(&env, &[0xA1u8; 32]);
         let ip_id = client.commit_ip(&owner, &hash, &0u32);
 
-        // Issue a challenge
         let nonce = BytesN::from_array(&env, &[0x42u8; 32]);
         let challenge_id = client.issue_ownership_challenge(&ip_id, &challenger, &nonce);
         assert_eq!(challenge_id, 1u64);
 
-        // Owner computes response: sha256(commitment_hash || nonce)
         let mut preimage = soroban_sdk::Bytes::new(&env);
         preimage.append(&hash.clone().into());
         preimage.append(&nonce.clone().into());
         let response: BytesN<32> = env.crypto().sha256(&preimage).into();
 
-        // Owner responds
         client.respond_to_ownership_challenge(&challenge_id, &response);
 
-        // Verify the challenge
         let valid = client.verify_ownership_challenge(&challenge_id);
         assert!(valid);
 
-        // Challenge should be marked verified
         let stored = client.get_ownership_challenge(&challenge_id).unwrap();
         assert!(stored.verified);
         assert_eq!(stored.ip_id, ip_id);
@@ -1207,7 +1211,6 @@ mod tests {
         let nonce = BytesN::from_array(&env, &[0x11u8; 32]);
         let challenge_id = client.issue_ownership_challenge(&ip_id, &challenger, &nonce);
 
-        // Wrong response
         let wrong_response = BytesN::from_array(&env, &[0xFFu8; 32]);
         client.respond_to_ownership_challenge(&challenge_id, &wrong_response);
 
@@ -1231,7 +1234,6 @@ mod tests {
         let nonce = BytesN::from_array(&env, &[0x22u8; 32]);
         let challenge_id = client.issue_ownership_challenge(&ip_id, &challenger, &nonce);
 
-        // No response submitted — verify should return false
         let valid = client.verify_ownership_challenge(&challenge_id);
         assert!(!valid);
     }
@@ -1247,7 +1249,6 @@ mod tests {
 
         let owner = <Address as TestAddress>::generate(&env);
 
-        // Commit with known secret/blinding_factor
         let secret = BytesN::from_array(&env, &[0x10u8; 32]);
         let bf = BytesN::from_array(&env, &[0x20u8; 32]);
         let mut pre = soroban_sdk::Bytes::new(&env);
@@ -1256,19 +1257,50 @@ mod tests {
         let old_hash: BytesN<32> = env.crypto().sha256(&pre).into();
         let ip_id = client.commit_ip(&owner, &old_hash, &0u32);
 
-        // New commitment hash (different value)
         let new_hash = BytesN::from_array(&env, &[0xD1u8; 32]);
-
         client.rotate_commitment_key(&ip_id, &new_hash, &secret, &bf);
 
-        // Record should now have new hash
         let record = client.get_ip(&ip_id);
         assert_eq!(record.commitment_hash, new_hash);
 
-        // Old hash should be in rotation history
         let history = client.get_key_rotation_history(&ip_id);
         assert_eq!(history.len(), 1);
         assert_eq!(history.get(0).unwrap(), old_hash);
+    }
+
+    // ── Tests for Issue #428: Commitment Timestamp Notarization (continued) ──
+
+    #[test]
+    fn test_notarize_ip_timestamp_with_valid_signature() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[50u8; 32]);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let public_key = BytesN::from_array(&env, verifying_key.as_bytes());
+
+        client.set_notary_public_key(&public_key);
+
+        let record = client.get_ip(&ip_id);
+        let mut msg_bytes = [0u8; 16];
+        msg_bytes[..8].copy_from_slice(&ip_id.to_be_bytes());
+        msg_bytes[8..].copy_from_slice(&record.timestamp.to_be_bytes());
+
+        let sig = signing_key.sign(&msg_bytes);
+        let notary_sig = soroban_sdk::Bytes::from_slice(&env, &sig.to_bytes());
+
+        client.notarize_ip_timestamp(&ip_id, &notary_sig);
+
+        let stored_sig = client.get_ip_notary_signature(&ip_id);
+        assert!(stored_sig.is_some());
     }
 
     #[test]
@@ -1292,7 +1324,6 @@ mod tests {
         let new_hash = BytesN::from_array(&env, &[0xE1u8; 32]);
         let wrong_secret = BytesN::from_array(&env, &[0xFFu8; 32]);
 
-        // Should panic: wrong old secret
         client.rotate_commitment_key(&ip_id, &new_hash, &wrong_secret, &bf);
     }
 
@@ -1309,7 +1340,6 @@ mod tests {
         let hash = BytesN::from_array(&env, &[0xF1u8; 32]);
         let ip_id = client.commit_ip(&owner, &hash, &0u32);
 
-        // Single leaf: proof is empty
         let proof = client.generate_merkle_proof(&ip_id);
         assert_eq!(proof.len(), 0);
     }
@@ -1331,7 +1361,6 @@ mod tests {
         let id2 = client.commit_ip(&owner, &h2, &0u32);
         let id3 = client.commit_ip(&owner, &h3, &0u32);
 
-        // Generate proof for each IP and verify it
         let proof1 = client.generate_merkle_proof(&id1);
         let proof2 = client.generate_merkle_proof(&id2);
         let proof3 = client.generate_merkle_proof(&id3);
@@ -1358,14 +1387,12 @@ mod tests {
 
         let root = client.compute_ip_merkle_root(&owner);
 
-        // Both proofs should verify against the same root
         let proof1 = client.generate_merkle_proof(&id1);
         let proof2 = client.generate_merkle_proof(&id2);
 
         assert!(client.verify_ip_merkle_proof(&id1, &proof1));
         assert!(client.verify_ip_merkle_proof(&id2, &proof2));
 
-        // Root should be non-zero
         let zero = BytesN::from_array(&env, &[0u8; 32]);
         assert_ne!(root, zero);
     }
@@ -1437,6 +1464,28 @@ mod tests {
 
     #[test]
     #[should_panic]
+    fn test_notarize_ip_timestamp_invalid_signature_panics() {
+        use ed25519_dalek::SigningKey;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[51u8; 32]);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let signing_key = SigningKey::from_bytes(&[43u8; 32]);
+        let public_key = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+        client.set_notary_public_key(&public_key);
+
+        let bad_sig = soroban_sdk::Bytes::from_array(&env, &[0u8; 64]);
+        client.notarize_ip_timestamp(&ip_id, &bad_sig);
+    }
+
+    #[test]
+    #[should_panic]
     fn test_submit_evidence_by_non_party_panics() {
         let env = Env::default();
         let contract_id = env.register(crate::IpRegistry, ());
@@ -1453,7 +1502,6 @@ mod tests {
             &BytesN::from_array(&env, &[0x33u8; 32]),
         );
 
-        // Stranger is neither owner nor challenger — must panic
         client.submit_dispute_evidence(
             &dispute_id,
             &stranger,
@@ -1486,6 +1534,22 @@ mod tests {
 
     #[test]
     #[should_panic]
+    fn test_notarize_ip_timestamp_no_public_key_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[52u8; 32]);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let sig = soroban_sdk::Bytes::from_array(&env, &[0u8; 64]);
+        client.notarize_ip_timestamp(&ip_id, &sig);
+    }
+
+    #[test]
+    #[should_panic]
     fn test_resolve_dispute_twice_panics() {
         let env = Env::default();
         let contract_id = env.register(crate::IpRegistry, ());
@@ -1502,7 +1566,6 @@ mod tests {
         );
 
         client.resolve_dispute(&dispute_id, &owner);
-        // Second resolve must panic (DisputeAlreadyResolved)
         client.resolve_dispute(&dispute_id, &challenger);
     }
 
@@ -1543,5 +1606,223 @@ mod tests {
             false
         });
         assert!(found, "dispute event must be emitted; dispute_id={dispute_id}");
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_notarize_ip_timestamp_wrong_sig_length_panics() {
+        use ed25519_dalek::SigningKey;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[53u8; 32]);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let signing_key = SigningKey::from_bytes(&[44u8; 32]);
+        let public_key = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+        client.set_notary_public_key(&public_key);
+
+        let bad_sig = soroban_sdk::Bytes::from_array(&env, &[1u8; 32]);
+        client.notarize_ip_timestamp(&ip_id, &bad_sig);
+    }
+
+    // ── Tests for Issue #429: IP Rollback Protection ──────────────────────────
+
+    #[test]
+    fn test_commitment_checksum_updated_on_commit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+
+        assert!(client.verify_commitment_integrity());
+
+        let commitment1 = BytesN::from_array(&env, &[60u8; 32]);
+        client.commit_ip(&owner, &commitment1, &0u32);
+        assert!(client.verify_commitment_integrity());
+
+        let commitment2 = BytesN::from_array(&env, &[61u8; 32]);
+        client.commit_ip(&owner, &commitment2, &0u32);
+        assert!(client.verify_commitment_integrity());
+    }
+
+    #[test]
+    fn test_commitment_checksum_reflects_all_commitments() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[62u8; 32]);
+        client.commit_ip(&owner, &commitment, &0u32);
+
+        let result1 = client.verify_commitment_integrity();
+        let result2 = client.verify_commitment_integrity();
+        assert_eq!(result1, result2);
+    }
+
+    // ── Tests for Issue #430: IP Commitment Versioning ────────────────────────
+
+    #[test]
+    fn test_get_ip_versions_returns_direct_children() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment1 = BytesN::from_array(&env, &[70u8; 32]);
+        let ip_id = client.commit_ip(&owner, &commitment1, &0u32);
+
+        let versions = client.get_ip_versions(&ip_id);
+        assert_eq!(versions.len(), 0);
+
+        let commitment2 = BytesN::from_array(&env, &[71u8; 32]);
+        let v1 = client.commit_ip_version(&owner, &commitment2, &ip_id);
+
+        let commitment3 = BytesN::from_array(&env, &[72u8; 32]);
+        let v2 = client.commit_ip_version(&owner, &commitment3, &ip_id);
+
+        let versions = client.get_ip_versions(&ip_id);
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions.get(0).unwrap(), v1);
+        assert_eq!(versions.get(1).unwrap(), v2);
+    }
+
+    #[test]
+    fn test_get_ip_versions_empty_for_no_versions() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[73u8; 32]);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let versions = client.get_ip_versions(&ip_id);
+        assert_eq!(versions.len(), 0);
+    }
+
+    #[test]
+    fn test_get_ip_lineage_includes_root_and_versions() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment1 = BytesN::from_array(&env, &[74u8; 32]);
+        let root_id = client.commit_ip(&owner, &commitment1, &0u32);
+
+        let commitment2 = BytesN::from_array(&env, &[75u8; 32]);
+        let v1 = client.commit_ip_version(&owner, &commitment2, &root_id);
+
+        let lineage = client.get_ip_lineage(&root_id);
+        assert!(lineage.len() >= 2);
+        assert_eq!(lineage.get(0).unwrap(), root_id);
+
+        let mut found = false;
+        for i in 0..lineage.len() {
+            if lineage.get(i).unwrap() == v1 { found = true; break; }
+        }
+        assert!(found, "v1 should be in lineage");
+    }
+
+    #[test]
+    fn test_get_ip_version_chain_includes_all() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment1 = BytesN::from_array(&env, &[76u8; 32]);
+        let root_id = client.commit_ip(&owner, &commitment1, &0u32);
+
+        let commitment2 = BytesN::from_array(&env, &[77u8; 32]);
+        let v1 = client.commit_ip_version(&owner, &commitment2, &root_id);
+
+        let chain = client.get_ip_version_chain(&root_id);
+        assert!(chain.len() >= 2);
+        assert_eq!(chain.get(0).unwrap(), root_id);
+
+        let mut found_v1 = false;
+        for i in 0..chain.len() {
+            if chain.get(i).unwrap() == v1 { found_v1 = true; break; }
+        }
+        assert!(found_v1, "v1 should be in version chain");
+    }
+
+    // ── Tests for Issue #431: IP Claim Expiration Warnings ───────────────────
+
+    #[test]
+    fn test_check_expiration_warning_not_expiring() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[80u8; 32]);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let is_expiring = client.check_expiration_warning(&ip_id, &1u32);
+        assert!(!is_expiring, "Newly committed IP should not be expiring");
+    }
+
+    #[test]
+    fn test_check_expiration_warning_large_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[81u8; 32]);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let is_expiring = client.check_expiration_warning(&ip_id, &(crate::LEDGER_BUMP + 1));
+        assert!(is_expiring, "IP should be expiring when threshold > LEDGER_BUMP");
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_check_expiration_warning_nonexistent_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        client.check_expiration_warning(&999u64, &100u32);
+    }
+
+    #[test]
+    fn test_check_expiration_warning_emits_event_when_expiring() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let commitment = BytesN::from_array(&env, &[82u8; 32]);
+        let ip_id = client.commit_ip(&owner, &commitment, &0u32);
+
+        let _ = env.events().all();
+
+        let is_expiring = client.check_expiration_warning(&ip_id, &(crate::LEDGER_BUMP + 1));
+        assert!(is_expiring);
+
+        let events = env.events().all();
+        assert!(events.len() > 0, "Expiration warning event should be emitted");
+        let event = events.get(0).unwrap();
+        let expected_topics = (symbol_short!("exp_warn"), ip_id).into_val(&env);
+        assert_eq!(event.1, expected_topics);
     }
 }

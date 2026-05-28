@@ -1,7 +1,7 @@
 {
   "generators": {
-    "address": 3,
-    "nonce": 1
+    "address": 2,
+    "nonce": 0
   },
   "auth": [
     [],
@@ -18,7 +18,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "bytes": "6949d8f4b9e525930b71ee1e4b602ebc89adeb6e7803f6c1dabd9f643fb40059"
+                  "bytes": "5050505050505050505050505050505050505050505050505050505050505050"
                 },
                 {
                   "u32": 0
@@ -30,7 +30,6 @@
         }
       ]
     ],
-    [],
     []
   ],
   "ledger": {
@@ -114,7 +113,7 @@
                 "val": {
                   "vec": [
                     {
-                      "bytes": "6949d8f4b9e525930b71ee1e4b602ebc89adeb6e7803f6c1dabd9f643fb40059"
+                      "bytes": "5050505050505050505050505050505050505050505050505050505050505050"
                     }
                   ]
                 }
@@ -135,7 +134,7 @@
                   "symbol": "CommitmentOwner"
                 },
                 {
-                  "bytes": "6949d8f4b9e525930b71ee1e4b602ebc89adeb6e7803f6c1dabd9f643fb40059"
+                  "bytes": "5050505050505050505050505050505050505050505050505050505050505050"
                 }
               ]
             },
@@ -155,7 +154,7 @@
                       "symbol": "CommitmentOwner"
                     },
                     {
-                      "bytes": "6949d8f4b9e525930b71ee1e4b602ebc89adeb6e7803f6c1dabd9f643fb40059"
+                      "bytes": "5050505050505050505050505050505050505050505050505050505050505050"
                     }
                   ]
                 },
@@ -200,7 +199,7 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "bytes": "bca74ab50316fc13723f64b52b20b571a0c2f77a65f6e21773fd705f9876fdc4"
+                  "bytes": "b37361a0be8af8905de1f4384e701365ece4313dd5e064d375eb2851c043ba68"
                 }
               }
             },
@@ -259,7 +258,7 @@
                         "symbol": "commitment_hash"
                       },
                       "val": {
-                        "bytes": "6949d8f4b9e525930b71ee1e4b602ebc89adeb6e7803f6c1dabd9f643fb40059"
+                        "bytes": "5050505050505050505050505050505050505050505050505050505050505050"
                       }
                     },
                     {
@@ -466,38 +465,6 @@
             "ext": "v0"
           },
           6311999
-        ]
-      ],
-      [
-        {
-          "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
-            "key": "ledger_key_contract_instance",
-            "durability": "persistent"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
-                "key": "ledger_key_contract_instance",
-                "durability": "persistent",
-                "val": {
-                  "contract_instance": {
-                    "executable": {
-                      "wasm": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-                    },
-                    "storage": null
-                  }
-                }
-              }
-            },
-            "ext": "v0"
-          },
-          4095
         ]
       ],
       [
