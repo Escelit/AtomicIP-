@@ -824,6 +824,87 @@ impl AtomicSwap {
         );
     }
 
+    /// Admin batch rollback: cancel multiple swaps and refund all parties in one call.
+    /// Pre-validates all swap IDs before making any state changes (#521).
+    pub fn batch_rollback_swaps(env: Env, swap_ids: Vec<u64>, caller: Address, reason: Bytes) {
+        caller.require_auth();
+        require_admin(&env, &caller);
+
+        let len = swap_ids.len();
+
+        if len == 0 {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchEmpty as u32));
+        }
+        if len > MAX_BATCH_SIZE {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchTooLarge as u32));
+        }
+
+        // Pre-validation pass: ensure every swap exists and is rollbackable
+        for swap_id in swap_ids.iter() {
+            let swap = require_swap_exists(&env, swap_id);
+            if swap.status == SwapStatus::Completed {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NotInAccepted as u32,
+                ));
+            }
+        }
+
+        // Execution pass: roll back each swap
+        for swap_id in swap_ids.iter() {
+            let mut swap = require_swap_exists(&env, swap_id);
+            let token_client = token::Client::new(&env, &swap.token);
+
+            if swap.status == SwapStatus::Accepted || swap.status == SwapStatus::Disputed {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &swap.buyer,
+                    &swap.price,
+                );
+
+                if let Some(collateral) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+                {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &swap.buyer,
+                        &collateral,
+                    );
+                    env.storage().persistent().remove(&DataKey::SwapCollateral(swap_id));
+                }
+
+                if swap.insurance_premium > 0 {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &swap.buyer,
+                        &swap.insurance_premium,
+                    );
+                }
+            }
+
+            swap.status = SwapStatus::Cancelled;
+            swap::save_swap(&env, swap_id, &swap);
+            env.storage().persistent().remove(&DataKey::ActiveSwap(swap.ip_id));
+            env.storage().persistent().set(&DataKey::CancelReason(swap_id), &reason);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::CancelReason(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            Self::append_history(&env, swap_id, SwapStatus::Cancelled);
+        }
+
+        // #519: Emit batch rollback event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("btch_rlb"),),
+            BatchRollbackEvent {
+                swap_ids,
+                caller,
+                count: len as u32,
+            },
+        );
+    }
+
     /// Anyone can call after dispute_resolution_timeout_seconds to auto-refund the buyer.
     pub fn auto_resolve_dispute(env: Env, swap_id: u64) {
         let mut swap = require_swap_exists(&env, swap_id);
