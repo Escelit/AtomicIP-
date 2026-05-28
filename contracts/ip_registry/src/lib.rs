@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Bytes, BytesN, Env, Error, Vec,
+    Bytes, BytesN, Env, Error, IntoVal, Vec,
 };
 
 mod validation;
@@ -114,6 +114,27 @@ pub enum DataKey {
     NotaryPublicKey,        // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
     CommitmentHashes,       // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
     IpPowDifficulty(u64),   // stores the pow_difficulty used at commit time for strength scoring
+    ThresholdConfig(u64),   // Issue #454: M-of-N signer configuration per IP
+    ThresholdSignatures(u64), // Issue #454: collected threshold signatures per IP
+    BatchMetadata(u64),     // Issue #455: batch metadata for an IP
+    CompressionSelection(u64), // Issue #456: per-IP compression selection
+    EncryptedCommitment(u64), // Issue #457: encrypted commitment record
+    CompressedCommitment(u64),
+    ShardIps(u32),
+    IpAuditTrail(u64),
+    NextDisputeId,
+    IpStake(u64),
+    OwnerReputation(Address),
+    ArbitratorPool,
+    NextArbitrationId,
+    // Issue #449 / #451: arbitration and dispute records
+    ArbitrationCase(u64),
+    IpDisputes(u64),
+    // Issue #450: renewal counters
+    RenewalCount(u64),
+    // Issue #451: delegation chains
+    DelegateDepth(Address),
+    Delegates(Address),
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -608,8 +629,8 @@ impl IpRegistry {
     ///
     /// # Events
     ///
-    /// Emits one `"ip_commit_anon"` event per commitment:
-    /// - Topics: `(symbol_short!("ip_commit_anon"), contract_address)`
+    /// Emits one `"ip_cmt_a"` event per commitment:
+    /// - Topics: `(symbol_short!("ip_cmt_a"), contract_address)`
     /// - Data: `(ip_id: u64, timestamp: u64, blinded_owner: BytesN<32>)`
     ///
     /// # Storage
@@ -698,7 +719,7 @@ impl IpRegistry {
             );
 
             env.events().publish(
-                (symbol_short!("ip_commit_anon"), env.current_contract_address()),
+                (symbol_short!("ip_cmt_a"), env.current_contract_address()),
                 (id, timestamp, blinded_owner.clone()),
             );
 
@@ -932,6 +953,199 @@ impl IpRegistry {
     /// Panics if the IP record does not exist (IpNotFound error).
     pub fn get_ip(env: Env, ip_id: u64) -> IpRecord {
         require_ip_exists(&env, ip_id)
+    }
+
+    // ── Issue #454: Threshold Signatures ───────────────────────────────────
+    pub fn require_threshold_signatures(
+        env: Env,
+        ip_id: u64,
+        threshold: u32,
+        signers: soroban_sdk::Vec<Address>,
+    ) {
+        require_ip_exists(&env, ip_id);
+        if threshold == 0 || threshold > signers.len() as u32 {
+            panic_with_error!(&env, ContractError::ThresholdNotMet);
+        }
+
+        let config = ThresholdConfig {
+            ip_id,
+            threshold,
+            total: signers.len() as u32,
+            signers: signers.clone(),
+        };
+
+        env.storage().persistent().set(&DataKey::ThresholdConfig(ip_id), &config);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ThresholdConfig(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ThresholdSignatures(ip_id), &soroban_sdk::Vec::<ThresholdSignature>::new(&env));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ThresholdSignatures(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    pub fn get_threshold_config(env: Env, ip_id: u64) -> Option<ThresholdConfig> {
+        require_ip_exists(&env, ip_id);
+        env.storage().persistent().get(&DataKey::ThresholdConfig(ip_id))
+    }
+
+    pub fn add_threshold_signature(env: Env, ip_id: u64, signer: Address, signature_hash: BytesN<32>) {
+        require_ip_exists(&env, ip_id);
+        let config: ThresholdConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ThresholdConfig(ip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::SignerNotAuthorized));
+
+        if !config.signers.iter().any(|entry| entry == signer) {
+            panic_with_error!(&env, ContractError::SignerNotAuthorized);
+        }
+
+        let mut signatures: soroban_sdk::Vec<ThresholdSignature> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ThresholdSignatures(ip_id))
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+
+        if signatures.iter().any(|entry| entry.signer == signer) {
+            panic_with_error!(&env, ContractError::AlreadySigned);
+        }
+
+        signatures.push_back(ThresholdSignature {
+            signer: signer.clone(),
+            signature_hash,
+            timestamp: env.ledger().timestamp(),
+        });
+
+        env.storage().persistent().set(&DataKey::ThresholdSignatures(ip_id), &signatures);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ThresholdSignatures(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    pub fn get_threshold_signatures(env: Env, ip_id: u64) -> soroban_sdk::Vec<ThresholdSignature> {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::ThresholdSignatures(ip_id))
+            .unwrap_or(soroban_sdk::Vec::new(&env))
+    }
+
+    pub fn verify_threshold_signatures(env: Env, ip_id: u64) -> bool {
+        require_ip_exists(&env, ip_id);
+        let config: Option<ThresholdConfig> = env.storage().persistent().get(&DataKey::ThresholdConfig(ip_id));
+        let config = match config {
+            Some(c) => c,
+            None => return false,
+        };
+        let signatures = Self::get_threshold_signatures(env.clone(), ip_id);
+        signatures.len() >= config.threshold as u32
+    }
+
+    // ── Issue #455: Batch Metadata ──────────────────────────────────────────
+    pub fn set_batch_metadata(env: Env, ip_id: u64, batch_id: BytesN<32>, description: Bytes) {
+        require_ip_exists(&env, ip_id);
+        if description.len() > MAX_METADATA_BYTES {
+            panic_with_error!(&env, ContractError::BatchMetadataTooLarge);
+        }
+
+        let record = BatchMetadata {
+            ip_id,
+            batch_id,
+            description,
+            timestamp: env.ledger().timestamp(),
+        };
+
+        env.storage().persistent().set(&DataKey::BatchMetadata(ip_id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::BatchMetadata(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    pub fn get_batch_metadata(env: Env, ip_id: u64) -> Option<BatchMetadata> {
+        require_ip_exists(&env, ip_id);
+        env.storage().persistent().get(&DataKey::BatchMetadata(ip_id))
+    }
+
+    // ── Issue #456: Compression Algorithm Selection ────────────────────────
+    pub fn get_commitment_compression(env: Env, ip_id: u64) -> CompressionAlgo {
+        require_ip_exists(&env, ip_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompressionSelection(ip_id))
+            .map(|selection: CompressionSelection| selection.algorithm)
+            .unwrap_or(CompressionAlgo::Truncate16)
+    }
+
+    pub fn set_commitment_compression(env: Env, ip_id: u64, algorithm: CompressionAlgo) {
+        require_ip_exists(&env, ip_id);
+        let selection = CompressionSelection {
+            ip_id,
+            algorithm,
+        };
+        env.storage().persistent().set(&DataKey::CompressionSelection(ip_id), &selection);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::CompressionSelection(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    pub fn get_compressed_bytes(env: Env, ip_id: u64) -> Bytes {
+        require_ip_exists(&env, ip_id);
+        let record = require_ip_exists(&env, ip_id);
+        let algo = Self::get_commitment_compression(env.clone(), ip_id);
+        let hash = record.commitment_hash;
+
+        match algo {
+            CompressionAlgo::None => Bytes::from_array(&env, &hash.to_array()).into(),
+            CompressionAlgo::Truncate16 => {
+                let mut bytes = Bytes::new(&env);
+                let arr = hash.to_array();
+                for i in 0..16 {
+                    bytes.push_back(arr[i as usize]);
+                }
+                bytes
+            }
+            CompressionAlgo::Xor8 => {
+                let mut bytes = Bytes::new(&env);
+                let arr = hash.to_array();
+                let mut acc = 0u8;
+                for b in arr.iter() {
+                    acc ^= *b;
+                }
+                for _ in 0..8 {
+                    bytes.push_back(acc);
+                }
+                bytes
+            }
+        }
+    }
+
+    // ── Issue #457: Commitment Encryption ───────────────────────────────────
+    pub fn encrypt_commitment(env: Env, ip_id: u64, encrypted_hash: Bytes, key_hint: BytesN<32>) {
+        require_ip_exists(&env, ip_id);
+        if encrypted_hash.len() > 256 {
+            panic_with_error!(&env, ContractError::EncryptedDataTooLarge);
+        }
+
+        let record = EncryptedCommitmentRecord {
+            ip_id,
+            encrypted_hash,
+            key_hint,
+            timestamp: env.ledger().timestamp(),
+        };
+
+        env.storage().persistent().set(&DataKey::EncryptedCommitment(ip_id), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::EncryptedCommitment(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    pub fn get_encrypted_commitment(env: Env, ip_id: u64) -> Option<EncryptedCommitmentRecord> {
+        require_ip_exists(&env, ip_id);
+        env.storage().persistent().get(&DataKey::EncryptedCommitment(ip_id))
     }
 
     /// Verify a commitment: hash the secret and blinding factor, then compare to stored commitment hash.
@@ -1842,16 +2056,25 @@ impl IpRegistry {
         all_leaves: &Vec<BytesN<32>>,
     ) -> bool {
         let root = Self::merkle_root(env, all_leaves);
-        let mut computed = leaf.clone();
 
-        for proof_hash in proof.iter() {
+        fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
             let mut combined = Bytes::new(env);
-            combined.append(&computed.into());
-            combined.append(&proof_hash.into());
-            computed = env.crypto().sha256(&combined).into();
+            combined.append(&left.clone().into());
+            combined.append(&right.clone().into());
+            env.crypto().sha256(&combined).into()
         }
 
-        computed == root
+        let mut candidates = Vec::from_array(env, [leaf.clone()]);
+        for proof_hash in proof.iter() {
+            let mut next = Vec::new(env);
+            for candidate in candidates.iter() {
+                next.push_back(hash_pair(env, &candidate, &proof_hash));
+                next.push_back(hash_pair(env, &proof_hash, &candidate));
+            }
+            candidates = next;
+        }
+
+        candidates.iter().any(|candidate| candidate == root)
     }
 
     // ── Issue #344: Tiered Access Control ──────────────────────────────────────
@@ -2153,7 +2376,7 @@ impl IpRegistry {
         let owner: Option<Address> = env
             .storage()
             .persistent()
-            .get(&DataKey::CommitmentOwner(commitment_hash));
+            .get(&DataKey::CommitmentOwner(commitment_hash.clone()));
         if owner.is_none() {
             return None;
         }
@@ -3823,7 +4046,7 @@ mod tests {
         let ip_id = client.commit_ip(&owner, &hash, &0u32);
 
         client.set_commitment_compression(&ip_id, &CompressionAlgo::Truncate16);
-        assert_eq!(client.get_compressed_commitment_by_algo(&ip_id).len(), 16);
+        assert_eq!(client.get_compressed_bytes(&ip_id).len(), 16);
     }
 
     #[test]
@@ -3838,7 +4061,7 @@ mod tests {
         let ip_id = client.commit_ip(&owner, &hash, &0u32);
 
         client.set_commitment_compression(&ip_id, &CompressionAlgo::Xor8);
-        assert_eq!(client.get_compressed_commitment_by_algo(&ip_id).len(), 8);
+        assert_eq!(client.get_compressed_bytes(&ip_id).len(), 8);
     }
 
     #[test]
@@ -3853,7 +4076,7 @@ mod tests {
         let ip_id = client.commit_ip(&owner, &hash, &0u32);
 
         client.set_commitment_compression(&ip_id, &CompressionAlgo::None);
-        assert_eq!(client.get_compressed_commitment_by_algo(&ip_id).len(), 32);
+        assert_eq!(client.get_compressed_bytes(&ip_id).len(), 32);
     }
 
     // ── Issue #457: Commitment Encryption Tests ───────────────────────────────
