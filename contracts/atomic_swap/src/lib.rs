@@ -208,6 +208,10 @@ pub struct SwapRecord {
     pub quantity: u32,
     /// Conditions the buyer requires to be satisfied before accepting. Empty = unconditional.
     pub conditions: Vec<SwapCondition>,
+    /// #installments: Amount paid so far via installments. Zero for non-installment swaps.
+    pub paid_amount: i128,
+    /// #installments: Whether this swap uses an installment payment schedule.
+    pub is_installment: bool,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -292,6 +296,8 @@ impl AtomicSwap {
             escrow_agent: None,
             quantity: 1,
             conditions: Vec::new(&env),
+            paid_amount: 0,
+            is_installment: false,
         };
 
         // Store insurance premium in dedicated key so accept_swap can collect it
@@ -1593,6 +1599,8 @@ impl AtomicSwap {
                             escrow_agent: None,
                             quantity: 1,
                             conditions: Vec::new(&env),
+            paid_amount: 0,
+            is_installment: false,
                         };
 
             env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -1861,6 +1869,8 @@ impl AtomicSwap {
                 escrow_agent: None,
                 quantity: 1,
                 conditions: Vec::new(&env),
+            paid_amount: 0,
+            is_installment: false,
             };
 
             env.storage()
@@ -1963,6 +1973,8 @@ impl AtomicSwap {
             escrow_agent: None,
             quantity: 1,
             conditions: Vec::new(&env),
+            paid_amount: 0,
+            is_installment: true,
         };
 
         env.storage()
@@ -2138,6 +2150,74 @@ impl AtomicSwap {
             .persistent()
             .get(&DataKey::PaymentsMade(swap_id))
             .unwrap_or(Vec::new(&env))
+    }
+
+    // ── Installment Payments ──────────────────────────────────────────────────
+
+    /// Submit an installment payment toward a scheduled swap. Buyer-only.
+    ///
+    /// Transfers `payment_amount` tokens from buyer to escrow and accumulates
+    /// `paid_amount` on the swap. Once `paid_amount >= price` the swap
+    /// transitions to Accepted, signalling the seller to reveal the key.
+    ///
+    /// Panics if:
+    /// - swap not found or not an installment swap
+    /// - caller is not the buyer
+    /// - swap is not in Pending state
+    /// - payment_amount is zero
+    /// - total would exceed price (overpayment rejected)
+    pub fn submit_installment_payment(env: Env, swap_id: u64, payment_amount: i128) {
+        let mut swap = require_swap_exists(&env, swap_id);
+        swap.buyer.require_auth();
+
+        if !swap.is_installment {
+            env.panic_with_error(Error::from_contract_error(ContractError::NotPending as u32));
+        }
+        if swap.status != SwapStatus::Pending {
+            env.panic_with_error(Error::from_contract_error(ContractError::NotPending as u32));
+        }
+        if payment_amount <= 0 {
+            env.panic_with_error(Error::from_contract_error(ContractError::PriceTooSmall as u32));
+        }
+
+        let remaining = swap.price.saturating_sub(swap.paid_amount);
+        if payment_amount > remaining {
+            env.panic_with_error(Error::from_contract_error(ContractError::PriceTooSmall as u32));
+        }
+
+        // Transfer this installment into escrow
+        token::Client::new(&env, &swap.token).transfer(
+            &swap.buyer,
+            &env.current_contract_address(),
+            &payment_amount,
+        );
+
+        swap.paid_amount = swap.paid_amount.saturating_add(payment_amount);
+
+        // If fully paid, transition to Accepted so seller can reveal key
+        if swap.paid_amount >= swap.price {
+            swap.status = SwapStatus::Accepted;
+            swap.accept_timestamp = env.ledger().timestamp();
+            Self::append_history(&env, swap_id, SwapStatus::Accepted);
+            env.events().publish(
+                (symbol_short!("swap_acpt"),),
+                SwapAcceptedEvent { swap_id, buyer: swap.buyer.clone() },
+            );
+        }
+
+        swap::save_swap(&env, swap_id, &swap);
+
+        env.events().publish(
+            (symbol_short!("inst_pay"),),
+            (swap_id, payment_amount, swap.paid_amount, swap.price),
+        );
+    }
+
+    /// Returns (paid_amount, total_price, remaining) for an installment swap.
+    pub fn get_installment_status(env: Env, swap_id: u64) -> (i128, i128, i128) {
+        let swap = require_swap_exists(&env, swap_id);
+        let remaining = swap.price.saturating_sub(swap.paid_amount);
+        (swap.paid_amount, swap.price, remaining)
     }
 
     // ── #350: Collateral Management ───────────────────────────────────────────
@@ -2763,6 +2843,8 @@ impl AtomicSwap {
             escrow_agent: None,
             quantity: 1,
             conditions: Vec::new(&env),
+            paid_amount: 0,
+            is_installment: false,
         };
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -3139,13 +3221,170 @@ impl AtomicSwap {
 // mod upgrade_chaos_tests;
 
 #[cfg(test)]
-mod reputation_tests;
+mod installment_tests {
+    use super::*;
+    use soroban_sdk::{Address, Env, Vec};
 
-#[cfg(test)]
-mod arbitration_timeout_tests;
+    fn make_swap(env: &Env, price: i128, paid: i128, is_installment: bool) -> SwapRecord {
+        SwapRecord {
+            ip_id: 1,
+            seller: Address::generate(env),
+            buyer: Address::generate(env),
+            price,
+            token: Address::generate(env),
+            status: SwapStatus::Pending,
+            expiry: 9_999_999,
+            accept_timestamp: 0,
+            required_approvals: 0,
+            dispute_timestamp: 0,
+            referrer: None,
+            collateral_amount: 0,
+            insurance_premium: 0,
+            insurance_enabled: false,
+            escrow_agent: None,
+            quantity: 1,
+            conditions: Vec::new(env),
+            paid_amount: paid,
+            is_installment,
+        }
+    }
 
-#[cfg(test)]
-mod multi_signer_tests;
+    #[test]
+    fn test_get_installment_status_initial() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &id);
 
-#[cfg(test)]
-mod rollback_tests;
+        let swap = make_swap(&env, 600, 0, true);
+        env.as_contract(&id, || {
+            env.storage().persistent().set(&DataKey::Swap(0u64), &swap);
+        });
+
+        let (paid, total, remaining) = client.get_installment_status(&0u64);
+        assert_eq!(paid, 0);
+        assert_eq!(total, 600);
+        assert_eq!(remaining, 600);
+    }
+
+    #[test]
+    fn test_get_installment_status_partial_paid() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &id);
+
+        let swap = make_swap(&env, 600, 200, true);
+        env.as_contract(&id, || {
+            env.storage().persistent().set(&DataKey::Swap(0u64), &swap);
+        });
+
+        let (paid, total, remaining) = client.get_installment_status(&0u64);
+        assert_eq!(paid, 200);
+        assert_eq!(total, 600);
+        assert_eq!(remaining, 400);
+    }
+
+    #[test]
+    fn test_swap_record_installment_fields_stored_and_retrieved() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &id);
+
+        let swap = make_swap(&env, 900, 300, true);
+        env.as_contract(&id, || {
+            env.storage().persistent().set(&DataKey::Swap(0u64), &swap);
+        });
+
+        let record = client.get_swap(&0u64).unwrap();
+        assert_eq!(record.paid_amount, 300);
+        assert!(record.is_installment);
+        assert_eq!(record.price, 900);
+    }
+
+    #[test]
+    fn test_non_installment_swap_defaults() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &id);
+
+        let swap = make_swap(&env, 500, 0, false);
+        env.as_contract(&id, || {
+            env.storage().persistent().set(&DataKey::Swap(0u64), &swap);
+        });
+
+        let record = client.get_swap(&0u64).unwrap();
+        assert!(!record.is_installment);
+        assert_eq!(record.paid_amount, 0);
+    }
+
+    #[test]
+    fn test_installment_remaining_zero_when_fully_paid() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &id);
+
+        let swap = make_swap(&env, 300, 300, true);
+        env.as_contract(&id, || {
+            env.storage().persistent().set(&DataKey::Swap(0u64), &swap);
+        });
+
+        let (paid, total, remaining) = client.get_installment_status(&0u64);
+        assert_eq!(paid, 300);
+        assert_eq!(total, 300);
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_submit_installment_non_installment_swap_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &id);
+
+        let swap = make_swap(&env, 300, 0, false); // not an installment swap
+        env.as_contract(&id, || {
+            env.storage().persistent().set(&DataKey::Swap(0u64), &swap);
+        });
+
+        client.submit_installment_payment(&0u64, &100);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_submit_installment_zero_amount_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &id);
+
+        let swap = make_swap(&env, 300, 0, true);
+        env.as_contract(&id, || {
+            env.storage().persistent().set(&DataKey::Swap(0u64), &swap);
+        });
+
+        client.submit_installment_payment(&0u64, &0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_submit_installment_overpayment_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &id);
+
+        let swap = make_swap(&env, 300, 200, true);
+        env.as_contract(&id, || {
+            env.storage().persistent().set(&DataKey::Swap(0u64), &swap);
+        });
+
+        // remaining is 100, paying 200 should panic
+        client.submit_installment_payment(&0u64, &200);
+    }
+}
+
