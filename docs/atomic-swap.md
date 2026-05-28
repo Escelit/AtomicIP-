@@ -220,3 +220,82 @@ swap_contract.reveal_key(swap_id, secret, blinding_factor);
 - [Commitment Scheme](commitment-scheme.md) — How to construct valid secrets
 - [Security Considerations](security.md) — Best practices for key management
 - [Threat Model](threat-model.md) — Attack vectors and mitigations
+
+---
+
+## Price Oracle Integration (#470)
+
+The atomic swap contract supports dynamic pricing via an on-chain price oracle.
+
+### Overview
+
+Instead of the seller specifying a fixed price at initiation time, the price can be fetched from a trusted oracle contract at the moment the swap is created. This enables:
+
+- Market-rate pricing for IP assets
+- Automatic price discovery without off-chain coordination
+- Slippage protection via min/max price bounds
+
+### Oracle Interface
+
+The oracle contract must expose a single function:
+
+```rust
+fn get_price(token: Address) -> i128
+```
+
+Returns the current price in stroops (1 XLM = 10^7 stroops) for the given payment token.
+
+### Admin Setup
+
+The contract admin sets the oracle address once:
+
+```rust
+atomic_swap.set_oracle(
+    admin,          // must be the contract admin
+    oracle_address, // address of the oracle contract
+    true,           // enabled
+);
+```
+
+### Oracle-Priced Swap
+
+```rust
+let swap_id = atomic_swap.initiate_swap_with_oracle_price(
+    token,              // payment token
+    ip_id,              // IP to sell
+    seller,             // seller address (requires auth)
+    buyer,              // buyer address
+    0,                  // required_approvals
+    None,               // referrer
+    0,                  // collateral_amount
+    false,              // insurance_enabled
+    100_000_000,        // min_price: reject if oracle < 10 XLM
+    500_000_000,        // max_price: reject if oracle > 50 XLM (0 = no bound)
+);
+```
+
+The price used in the swap is the oracle price at call time. If the oracle price falls outside `[min_price, max_price]`, the call panics and no swap is created.
+
+### Query Oracle Price
+
+Off-chain clients can preview the current oracle price before initiating:
+
+```rust
+let price = atomic_swap.get_oracle_price(token);
+```
+
+### Error Codes
+
+| Code | Name | Description |
+|------|------|-------------|
+| 46 | `OracleNotConfigured` | No oracle set, or oracle is disabled |
+| 47 | `OraclePriceInvalid` | Oracle returned a price ≤ 0 |
+| 48 | `OraclePriceBelowMin` | Oracle price is below the caller's `min_price` bound |
+| 49 | `OraclePriceAboveMax` | Oracle price is above the caller's `max_price` bound |
+
+### Events
+
+| Topic | Payload | When |
+|-------|---------|------|
+| `oracle` | `OracleConfigSetEvent { oracle_address, enabled }` | Admin calls `set_oracle` |
+| `ora_price` | `OraclePriceUsedEvent { swap_id, oracle_price }` | Oracle-priced swap initiated |
