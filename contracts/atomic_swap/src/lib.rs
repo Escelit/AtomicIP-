@@ -3991,6 +3991,8 @@ impl AtomicSwap {
 // #[cfg(test)]
 // mod upgrade_chaos_tests;
 
+include!("multi_signer_tests.rs");
+
 #[cfg(test)]
 mod batch_swap_features_tests;
 
