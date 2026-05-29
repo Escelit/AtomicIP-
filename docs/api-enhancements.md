@@ -1,385 +1,425 @@
-# API Enhancements: High Availability & Resilience
+# API Enhancements Documentation
 
-This document describes the four API enhancements implemented to improve reliability, observability, and performance under high load.
+This document describes the four major API enhancements implemented in issues #533-#536.
 
 ## Overview
 
-The API server now includes:
-1. **Fallback Endpoints** (#537) - High availability through RPC endpoint failover
-2. **Request Tracing** (#538) - Distributed tracing for debugging and monitoring
-3. **Error Recovery** (#539) - Automatic retry strategies with circuit breaker pattern
-4. **Request Queuing** (#540) - Load management during high traffic periods
+The Atomic Patent API has been enhanced with four critical features to improve reliability, security, and backward compatibility:
 
-## 1. Fallback Endpoints (#537)
+1. **API Compression Support** (#533) - Reduce bandwidth usage
+2. **API Versioning Strategy** (#534) - Support multiple API versions
+3. **Request Signing Verification** (#535) - Secure request authentication
+4. **Circuit Breaker** (#536) - Handle RPC failures gracefully
 
-### Purpose
-Support fallback RPC endpoints for high availability. If the primary endpoint fails, requests automatically route to fallback endpoints.
-
-### Features
-- **Primary + Fallback Configuration**: Define a primary endpoint and multiple fallback endpoints
-- **Health Tracking**: Each endpoint tracks consecutive failures
-- **Automatic Failover**: After 3 consecutive failures, an endpoint is marked unhealthy
-- **Endpoint Recovery**: Healthy endpoints can be restored after recovery
-- **Health Status API**: Query the health status of all endpoints
-
-### Usage
-
-```rust
-use api_server::fallback::{FallbackConfig, FallbackManager};
-use std::time::Duration;
-
-let config = FallbackConfig {
-    primary_endpoint: "https://soroban-testnet.stellar.org".to_string(),
-    fallback_endpoints: vec![
-        "https://soroban-testnet-backup1.stellar.org".to_string(),
-        "https://soroban-testnet-backup2.stellar.org".to_string(),
-    ],
-    health_check_interval: Duration::from_secs(30),
-    timeout: Duration::from_secs(5),
-};
-
-let manager = FallbackManager::new(config);
-
-// Get the active endpoint
-let endpoint = manager.get_active_endpoint();
-
-// Mark endpoint as failed
-manager.mark_failed(&endpoint);
-
-// Mark endpoint as healthy
-manager.mark_healthy(&endpoint);
-
-// Get health status
-let status = manager.get_health_status();
-```
-
-### Configuration
-
-Add to `.env`:
-```env
-PRIMARY_RPC_ENDPOINT=https://soroban-testnet.stellar.org
-FALLBACK_RPC_ENDPOINTS=https://soroban-testnet-backup1.stellar.org,https://soroban-testnet-backup2.stellar.org
-HEALTH_CHECK_INTERVAL_SECS=30
-RPC_TIMEOUT_SECS=5
-```
-
-## 2. Request Tracing (#538)
+## 1. API Compression Support (#533)
 
 ### Purpose
-Implement distributed tracing for request debugging and monitoring. Trace requests across service boundaries.
+Compress API responses using gzip and brotli to reduce bandwidth usage and improve performance.
 
-### Features
-- **Trace ID Generation**: Automatic UUID generation for each request
-- **Span ID Tracking**: Unique span IDs for request segments
-- **Parent-Child Relationships**: Support for distributed tracing hierarchies
-- **W3C Traceparent Standard**: Compatible with standard tracing formats
-- **Header Propagation**: Automatic trace context propagation in responses
+### Implementation
 
-### Usage
+#### Compression Middleware
+The compression middleware automatically detects the `Accept-Encoding` header and applies the appropriate compression:
 
 ```rust
-use api_server::distributed_tracing::{
-    DistributedTraceContext, 
-    distributed_tracing_middleware,
-    get_trace_context,
-};
-
-// Middleware automatically extracts/generates trace context
-// Access trace context in handlers:
-let trace_context = get_trace_context(req.headers());
-tracing::info!(
-    trace_id = %trace_context.trace_id,
-    span_id = %trace_context.span_id,
-    "Processing request"
-);
+pub async fn compression_middleware(
+    headers: HeaderMap,
+    req: Request,
+    next: Next,
+) -> Response
 ```
 
-### Headers
+#### Supported Encodings
+- **gzip** - Standard compression, widely supported
+- **brotli** - Modern compression with better compression ratios
+- **deflate** - Legacy compression support
 
-**Request Headers:**
-- `X-Trace-ID`: Trace ID (UUID format)
-- `X-Span-ID`: Parent span ID (UUID format)
+#### Configuration
+```rust
+pub struct CompressionConfig {
+    pub gzip_enabled: bool,
+    pub brotli_enabled: bool,
+    pub min_size_bytes: usize,  // Default: 1024
+}
+```
 
-**Response Headers:**
-- `X-Trace-ID`: Trace ID (echoed from request or generated)
-- `X-Span-ID`: New span ID for this request
+#### Usage Example
+```bash
+# Request with gzip compression
+curl -H "Accept-Encoding: gzip" http://localhost:8080/v1/ip/1
 
-### Example
+# Response headers
+Content-Encoding: gzip
+Vary: Accept-Encoding
+```
+
+#### Dependencies
+- `flate2` - For gzip compression
+- `brotli` - For brotli compression
+
+### Testing
+```bash
+cargo test compression
+```
+
+---
+
+## 2. API Versioning Strategy (#534)
+
+### Purpose
+Support multiple API versions for backward compatibility while allowing the API to evolve.
+
+### Implementation
+
+#### Supported Versions
+- `1.0.0` - Initial release
+- `1.1.0` - Future enhancements
+
+#### Version Negotiation Middleware
+```rust
+pub async fn version_negotiation(
+    headers: HeaderMap,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, StatusCode>
+```
+
+#### Version Header
+Clients specify the desired API version using the `Accept-Version` header:
 
 ```bash
-curl -H "X-Trace-ID: 550e8400-e29b-41d4-a716-446655440000" \
-     -H "X-Span-ID: 660e8400-e29b-41d4-a716-446655440001" \
-     http://localhost:8080/v1/ip/commit
+curl -H "Accept-Version: 1.0.0" http://localhost:8080/v1/ip/commit
 ```
 
-## 3. Error Recovery (#539)
-
-### Purpose
-Implement automatic error recovery strategies including retry logic and circuit breaker pattern.
-
-### Features
-- **Exponential Backoff**: Configurable retry delays with exponential growth
-- **Retryable Error Classification**: Automatic detection of retryable errors (5xx, timeouts)
-- **Circuit Breaker Pattern**: Prevent cascading failures
-- **Configurable Thresholds**: Customize failure thresholds and recovery behavior
-- **Recovery Strategies**: Multiple strategies (Retry, CircuitBreaker, Fallback, Fail)
-
-### Usage
-
-```rust
-use api_server::error_recovery::{
-    RetryConfig, 
-    CircuitBreaker,
-    CircuitBreakerState,
-    is_retryable_error,
-    calculate_backoff,
-};
-use std::time::Duration;
-
-// Configure retry behavior
-let config = RetryConfig {
-    max_retries: 3,
-    initial_backoff: Duration::from_millis(100),
-    max_backoff: Duration::from_secs(10),
-    backoff_multiplier: 2.0,
-};
-
-// Calculate backoff for attempt 2
-let backoff = calculate_backoff(2, &config);
-
-// Circuit breaker
-let mut cb = CircuitBreaker::new(
-    3,  // failure threshold
-    2,  // success threshold for recovery
-);
-
-cb.record_failure();
-cb.record_failure();
-cb.record_failure();
-assert_eq!(cb.get_state(), CircuitBreakerState::Open);
-
-// Attempt recovery
-if cb.can_attempt() {
-    // Try request
-    cb.record_success();
-}
+#### Response Headers
+```
+API-Version: 1.0.0
+Deprecation: false
 ```
 
-### Retryable Errors
-
-The following HTTP status codes trigger automatic retry:
-- `408 Request Timeout`
-- `429 Too Many Requests`
-- `502 Bad Gateway`
-- `503 Service Unavailable`
-- `504 Gateway Timeout`
-
-### Circuit Breaker States
-
-1. **Closed**: Normal operation, requests pass through
-2. **Open**: Too many failures, requests rejected immediately
-3. **Half-Open**: Testing if service recovered, limited requests allowed
-
-## 4. Request Queuing (#540)
-
-### Purpose
-Queue requests during high load to prevent server overload and ensure fair request handling.
-
-### Features
-- **Configurable Queue Size**: Limit total queued requests
-- **Concurrency Control**: Semaphore-based concurrent request limiting
-- **Request Timeout**: Configurable timeout for queued requests
-- **Queue Statistics**: Monitor queue depth and wait times
-- **Automatic Cleanup**: Guard pattern ensures queue cleanup
-
-### Usage
-
-```rust
-use api_server::request_queue::{RequestQueue, QueueConfig};
-use std::time::Duration;
-
-let config = QueueConfig {
-    max_queue_size: 1000,
-    max_concurrent_requests: 100,
-    request_timeout: Duration::from_secs(30),
-};
-
-let queue = RequestQueue::new(config);
-
-// Acquire queue slot
-match queue.acquire("request-123".to_string()).await {
-    Ok(_guard) => {
-        // Process request
-        // Guard automatically removes from queue when dropped
-    }
-    Err(status) => {
-        // Queue full or timeout
-    }
-}
-
-// Get queue statistics
-let stats = queue.get_stats();
-println!("Queue size: {}/{}", stats.queue_size, stats.max_queue_size);
-println!("Avg wait time: {:?}", stats.avg_wait_time);
+For deprecated versions:
+```
+API-Version: 1.0.0
+Deprecation: true
+Sunset: Sun, 31 Dec 2027 23:59:59 GMT
 ```
 
-### Configuration
-
-Add to `.env`:
-```env
-MAX_QUEUE_SIZE=1000
-MAX_CONCURRENT_REQUESTS=100
-REQUEST_TIMEOUT_SECS=30
+#### Version Information Endpoint
+```bash
+GET /version
 ```
 
-### Error Responses
-
-**Queue Full:**
+Response:
 ```json
 {
-  "error": "Service Unavailable",
-  "status": 503
+  "version": "1.0.0",
+  "status": "stable",
+  "supported_versions": ["1.0.0", "1.1.0"],
+  "deprecation_date": null,
+  "features": [
+    "api-versioning",
+    "compression",
+    "request-signing",
+    "circuit-breaker"
+  ]
 }
 ```
 
-**Request Timeout:**
-```json
-{
-  "error": "Request Timeout",
-  "status": 408
+#### Behavior
+- If no `Accept-Version` header is provided, the current version (1.0.0) is used
+- If an unsupported version is requested, the API returns `406 Not Acceptable`
+- Version information is stored in request extensions for handler access
+
+### Testing
+```bash
+cargo test versioning
+```
+
+---
+
+## 3. Request Signing Verification (#535)
+
+### Purpose
+Verify that API requests are signed by valid Stellar keypairs to prevent unauthorized access.
+
+### Implementation
+
+#### Stellar Keypair Validation
+Validates that public keys follow Stellar format:
+- Start with 'G'
+- Exactly 56 characters
+- Alphanumeric characters only
+
+```rust
+pub fn is_valid_stellar_public_key(key: &str) -> bool {
+    key.starts_with('G') && key.len() == 56 && key.chars().all(|c| c.is_alphanumeric())
 }
 ```
+
+#### Signature Generation
+Signatures are computed as SHA256 hash of concatenated request components:
+
+```
+signature = SHA256(method || path || timestamp || body_hash)
+```
+
+#### Request Headers Required
+```
+X-Signature: <signature>
+X-Timestamp: <unix_timestamp>
+X-Public-Key: <stellar_public_key>
+```
+
+#### Verification Process
+1. Extract signature, timestamp, and public key from headers
+2. Validate Stellar public key format
+3. Check timestamp is within 5 minutes (replay attack prevention)
+4. Hash request body using SHA256
+5. Recompute signature and compare
+
+#### Example Request
+```bash
+curl -X POST http://localhost:8080/v1/ip/commit \
+  -H "Content-Type: application/json" \
+  -H "X-Signature: abc123def456..." \
+  -H "X-Timestamp: 1234567890" \
+  -H "X-Public-Key: GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3XVQCRWGSGA" \
+  -d '{"owner":"G123","commitment_hash":"abc"}'
+```
+
+#### Security Features
+- **Replay Attack Prevention**: 5-minute timestamp window
+- **Body Integrity**: SHA256 hash of request body
+- **Method Verification**: HTTP method included in signature
+- **Path Verification**: Request path included in signature
+
+### Testing
+```bash
+cargo test request_signing
+```
+
+---
+
+## 4. Circuit Breaker (#536)
+
+### Purpose
+Implement the circuit breaker pattern to handle RPC failures gracefully and prevent cascading failures.
+
+### Implementation
+
+#### Circuit Breaker States
+
+**Closed** (Normal Operation)
+- Requests pass through normally
+- Failures are counted
+- When failure count reaches threshold, transitions to Open
+
+**Open** (Failure Mode)
+- Requests are rejected immediately
+- No calls to the failing service
+- After timeout period, transitions to HalfOpen
+
+**HalfOpen** (Recovery Testing)
+- Limited number of requests allowed (default: 3)
+- If requests succeed, transitions to Closed
+- If requests fail, transitions back to Open
+
+#### Configuration
+```rust
+pub struct CircuitBreakerConfig {
+    pub failure_threshold: usize,      // Default: 5
+    pub success_threshold: usize,      // Default: 2
+    pub timeout_secs: u64,             // Default: 60
+    pub half_open_max_calls: usize,    // Default: 3
+}
+```
+
+#### API
+```rust
+pub fn can_execute(&self) -> bool
+pub fn record_success(&self)
+pub fn record_failure(&self)
+pub fn get_state(&self) -> CircuitState
+pub fn reset(&self)
+```
+
+#### State Transitions
+```
+Closed --[failures >= threshold]--> Open
+Open --[timeout elapsed]--> HalfOpen
+HalfOpen --[successes >= threshold]--> Closed
+HalfOpen --[failure]--> Open
+```
+
+#### Usage Example
+```rust
+let cb = CircuitBreaker::new(CircuitBreakerConfig::default());
+
+if cb.can_execute() {
+    match rpc_call() {
+        Ok(result) => {
+            cb.record_success();
+            // Process result
+        }
+        Err(e) => {
+            cb.record_failure();
+            // Handle error
+        }
+    }
+} else {
+    // Circuit is open, return cached response or error
+    return Err("Service temporarily unavailable");
+}
+```
+
+#### Atomic Operations
+- Uses `AtomicUsize` and `AtomicU64` for thread-safe counters
+- No locks required for state transitions
+- Safe for concurrent access
+
+### Testing
+```bash
+cargo test circuit_breaker
+```
+
+---
 
 ## Integration
 
-### Middleware Stack
-
-The middleware stack should be ordered as:
+All features are integrated into the main application via middleware layers:
 
 ```rust
-.layer(middleware::from_fn(distributed_tracing_middleware))
-.layer(middleware::from_fn(error_recovery_middleware))
-.layer(middleware::from_fn(request_queue_middleware))
-.layer(middleware::from_fn(compression_middleware))
-```
-
-### Environment Variables
-
-```env
-# Fallback Endpoints
-PRIMARY_RPC_ENDPOINT=https://soroban-testnet.stellar.org
-FALLBACK_RPC_ENDPOINTS=https://backup1.stellar.org,https://backup2.stellar.org
-HEALTH_CHECK_INTERVAL_SECS=30
-RPC_TIMEOUT_SECS=5
-
-# Error Recovery
-MAX_RETRIES=3
-INITIAL_BACKOFF_MS=100
-MAX_BACKOFF_SECS=10
-BACKOFF_MULTIPLIER=2.0
-
-# Request Queuing
-MAX_QUEUE_SIZE=1000
-MAX_CONCURRENT_REQUESTS=100
-REQUEST_TIMEOUT_SECS=30
-```
-
-## Monitoring
-
-### Metrics
-
-Each module exposes metrics:
-
-**Fallback Endpoints:**
-- `api_fallback_endpoint_health` - Health status of each endpoint
-- `api_fallback_failover_count` - Number of failovers
-
-**Request Tracing:**
-- `api_trace_requests_total` - Total traced requests
-- `api_trace_duration_seconds` - Request duration histogram
-
-**Error Recovery:**
-- `api_retry_attempts_total` - Total retry attempts
-- `api_circuit_breaker_state` - Current circuit breaker state
-- `api_circuit_breaker_transitions` - State transitions
-
-**Request Queuing:**
-- `api_queue_size` - Current queue size
-- `api_queue_wait_time_seconds` - Average wait time
-- `api_queue_full_errors` - Queue full errors
-
-### Logging
-
-All modules use structured logging with trace context:
-
-```json
-{
-  "timestamp": "2026-05-29T10:42:09Z",
-  "level": "INFO",
-  "trace_id": "550e8400-e29b-41d4-a716-446655440000",
-  "span_id": "660e8400-e29b-41d4-a716-446655440001",
-  "message": "Request completed",
-  "duration_ms": 125
+fn build_app() -> Router {
+    Router::new()
+        // ... routes ...
+        .layer(middleware::from_fn(tracing_middleware::trace_requests))
+        .layer(middleware::from_fn(versioning::version_negotiation))
+        .layer(middleware::from_fn(compression::compression_middleware))
+        .layer(middleware::from_fn(require_json_content_type))
 }
 ```
 
+### Middleware Order
+1. **Tracing** - Log all requests
+2. **Version Negotiation** - Handle API versioning
+3. **Compression** - Apply response compression
+4. **Content-Type Validation** - Ensure JSON for POST/PUT/PATCH
+
+---
+
 ## Testing
 
-Each module includes comprehensive unit tests:
-
+Run all tests:
 ```bash
-# Run all tests
-cargo test -p api-server
-
-# Run specific module tests
-cargo test -p api-server fallback::tests
-cargo test -p api-server distributed_tracing::tests
-cargo test -p api-server error_recovery::tests
-cargo test -p api-server request_queue::tests
+cargo test
 ```
+
+Run specific feature tests:
+```bash
+cargo test compression
+cargo test versioning
+cargo test request_signing
+cargo test circuit_breaker
+```
+
+---
 
 ## Performance Considerations
 
-### Fallback Endpoints
-- Health checks run asynchronously
-- Minimal overhead for endpoint selection
-- Recommended: 2-3 fallback endpoints
+### Compression
+- Gzip: Good compression ratio, widely supported
+- Brotli: Better compression ratio, slightly slower
+- Minimum size threshold prevents compression overhead for small responses
 
-### Request Tracing
-- UUID generation per request (~1-2 µs)
-- Header parsing and propagation (~100 ns)
-- Minimal performance impact
+### Versioning
+- Minimal overhead (header parsing)
+- Version info stored in request extensions
+- No database lookups required
 
-### Error Recovery
-- Exponential backoff prevents thundering herd
-- Circuit breaker prevents cascading failures
-- Recommended: 3 retries with 2x multiplier
+### Request Signing
+- SHA256 hashing for all requests
+- Stellar keypair validation
+- Timestamp validation (5-minute window)
 
-### Request Queuing
-- Semaphore-based concurrency control
-- O(1) queue operations
-- Recommended: Queue size = 10x concurrent requests
+### Circuit Breaker
+- Atomic operations for lock-free concurrency
+- Minimal memory overhead
+- Configurable thresholds for different use cases
+
+---
+
+## Migration Guide
+
+### For API Clients
+
+#### 1. Add Compression Support
+```bash
+# Before
+curl http://localhost:8080/v1/ip/1
+
+# After (with compression)
+curl -H "Accept-Encoding: gzip" http://localhost:8080/v1/ip/1
+```
+
+#### 2. Specify API Version
+```bash
+# Before (uses default version)
+curl http://localhost:8080/v1/ip/1
+
+# After (explicit version)
+curl -H "Accept-Version: 1.0.0" http://localhost:8080/v1/ip/1
+```
+
+#### 3. Sign Requests
+```bash
+# Generate signature
+timestamp=$(date +%s)
+body='{"owner":"G123","commitment_hash":"abc"}'
+body_hash=$(echo -n "$body" | sha256sum | cut -d' ' -f1)
+signature=$(echo -n "POST||/v1/ip/commit||$timestamp||$body_hash" | sha256sum | cut -d' ' -f1)
+
+# Send signed request
+curl -X POST http://localhost:8080/v1/ip/commit \
+  -H "Content-Type: application/json" \
+  -H "X-Signature: $signature" \
+  -H "X-Timestamp: $timestamp" \
+  -H "X-Public-Key: GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3XVQCRWGSGA" \
+  -d "$body"
+```
+
+---
 
 ## Troubleshooting
 
-### All Endpoints Unhealthy
-- Check network connectivity
-- Verify endpoint URLs in configuration
-- Check RPC endpoint status pages
+### Compression Issues
+- Ensure `Accept-Encoding` header is set correctly
+- Check `Content-Encoding` in response headers
+- Verify minimum size threshold is not preventing compression
 
-### High Queue Wait Times
-- Increase `MAX_CONCURRENT_REQUESTS`
-- Optimize handler performance
-- Consider horizontal scaling
+### Versioning Issues
+- Use `Accept-Version` header for explicit version selection
+- Check `/version` endpoint for supported versions
+- Look for `Deprecation` header for version warnings
 
-### Circuit Breaker Stuck Open
-- Check downstream service health
-- Verify network connectivity
-- Check error logs for root cause
+### Signing Issues
+- Validate Stellar public key format (G-prefix, 56 chars)
+- Ensure timestamp is within 5 minutes
+- Verify body hash matches request body
+- Check signature computation order: method || path || timestamp || body_hash
 
-## References
+### Circuit Breaker Issues
+- Monitor circuit breaker state via metrics
+- Adjust failure/success thresholds for your use case
+- Use reset() for manual recovery
+- Check timeout configuration
 
-- [W3C Trace Context](https://www.w3.org/TR/trace-context/)
-- [Circuit Breaker Pattern](https://martinfowler.com/bliki/CircuitBreaker.html)
-- [Exponential Backoff](https://en.wikipedia.org/wiki/Exponential_backoff)
-- [Semaphore Pattern](https://en.wikipedia.org/wiki/Semaphore_(programming))
+---
+
+## Future Enhancements
+
+- [ ] Rate limiting per API version
+- [ ] Compression level configuration
+- [ ] Circuit breaker metrics export
+- [ ] Request signing with Ed25519 keys
+- [ ] API versioning with feature flags
+- [ ] Automatic compression based on response size
