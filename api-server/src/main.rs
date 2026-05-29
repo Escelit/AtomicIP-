@@ -26,6 +26,7 @@ mod request_signing;
 mod invariants;
 mod health;
 mod compression;
+mod validation;
 
 #[derive(OpenApi)]
 #[openapi(
