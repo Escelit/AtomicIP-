@@ -25,6 +25,9 @@ mod snapshot_tests;
 #[cfg(test)]
 mod differential_tests;
 
+#[cfg(test)]
+mod invariant_tests;
+
 // ── Error Codes ────────────────────────────────────────────────────────────
 
 #[contracterror]
