@@ -78,6 +78,9 @@ pub enum ContractError {
 /// ~1 year at ~5s per ledger: 365 * 24 * 3600 / 5 ≈ 6_307_200 ledgers.
 pub const LEDGER_BUMP: u32 = 6_307_200;
 
+/// Maximum number of items allowed in a single batch operation.
+pub const MAX_BATCH_SIZE: u32 = 50;
+
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -969,6 +972,87 @@ impl AtomicSwap {
         );
     }
 
+    /// Admin batch rollback: cancel multiple swaps and refund all parties in one call.
+    /// Pre-validates all swap IDs before making any state changes (#521).
+    pub fn batch_rollback_swaps(env: Env, swap_ids: Vec<u64>, caller: Address, reason: Bytes) {
+        caller.require_auth();
+        require_admin(&env, &caller);
+
+        let len = swap_ids.len();
+
+        if len == 0 {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchEmpty as u32));
+        }
+        if len > MAX_BATCH_SIZE {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchTooLarge as u32));
+        }
+
+        // Pre-validation pass: ensure every swap exists and is rollbackable
+        for swap_id in swap_ids.iter() {
+            let swap = require_swap_exists(&env, swap_id);
+            if swap.status == SwapStatus::Completed {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NotInAccepted as u32,
+                ));
+            }
+        }
+
+        // Execution pass: roll back each swap
+        for swap_id in swap_ids.iter() {
+            let mut swap = require_swap_exists(&env, swap_id);
+            let token_client = token::Client::new(&env, &swap.token);
+
+            if swap.status == SwapStatus::Accepted || swap.status == SwapStatus::Disputed {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &swap.buyer,
+                    &swap.price,
+                );
+
+                if let Some(collateral) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+                {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &swap.buyer,
+                        &collateral,
+                    );
+                    env.storage().persistent().remove(&DataKey::SwapCollateral(swap_id));
+                }
+
+                if swap.insurance_premium > 0 {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &swap.buyer,
+                        &swap.insurance_premium,
+                    );
+                }
+            }
+
+            swap.status = SwapStatus::Cancelled;
+            swap::save_swap(&env, swap_id, &swap);
+            env.storage().persistent().remove(&DataKey::ActiveSwap(swap.ip_id));
+            env.storage().persistent().set(&DataKey::CancelReason(swap_id), &reason);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::CancelReason(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            Self::append_history(&env, swap_id, SwapStatus::Cancelled);
+        }
+
+        // #519: Emit batch rollback event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("btch_rlb"),),
+            BatchRollbackEvent {
+                swap_ids,
+                caller,
+                count: len as u32,
+            },
+        );
+    }
+
     /// Anyone can call after dispute_resolution_timeout_seconds to auto-refund the buyer.
     pub fn auto_resolve_dispute(env: Env, swap_id: u64) {
         let mut swap = require_swap_exists(&env, swap_id);
@@ -1721,39 +1805,64 @@ impl AtomicSwap {
         seller.require_auth();
 
         let len = ip_ids.len();
+
+        // #520: Validate batch parameters upfront
+        if len == 0 {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchEmpty as u32));
+        }
+        if prices.len() != len {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchSizeMismatch as u32));
+        }
+        if len > MAX_BATCH_SIZE {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchTooLarge as u32));
+        }
+
+        // #522: Pre-validation pass — no mutations; ensures full atomicity
+        for i in 0..len {
+            let ip_id = ip_ids.get(i).unwrap();
+            let price = prices.get(i).unwrap();
+            require_positive_price(&env, price);
+            registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
+            require_no_active_swap(&env, ip_id);
+            // Detect duplicate IP IDs within the batch
+            for j in (i + 1)..len {
+                if ip_ids.get(j).unwrap() == ip_id {
+                    env.panic_with_error(Error::from_contract_error(
+                        ContractError::SwapExists as u32,
+                    ));
+                }
+            }
+        }
+
+        // Execution pass — all validations passed, safe to mutate
         let mut swap_ids: Vec<u64> = Vec::new(&env);
 
         for i in 0..len {
             let ip_id = ip_ids.get(i).unwrap();
             let price = prices.get(i).unwrap();
-
-            require_positive_price(&env, price);
-            registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
-            require_no_active_swap(&env, ip_id);
-
             let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
 
-                        let swap = SwapRecord {
-                            ip_id,
-                            seller: seller.clone(),
-                            buyer: buyer.clone(),
-                            price,
-                            token: token.clone(),
-                            status: SwapStatus::Pending,
-                            expiry: env.ledger().timestamp() + 604800u64,
-                            accept_timestamp: 0,
-                            required_approvals,
-                            dispute_timestamp: 0,
-                            referrer: referrer.clone(),
-                            collateral_amount: 0,
-                            insurance_premium: 0,
-                            insurance_enabled: false,
-                            escrow_agent: None,
-                            quantity: 1,
-                            conditions: Vec::new(&env),
-            paid_amount: 0,
-            is_installment: false,
-                        };
+            let swap = SwapRecord {
+                ip_id,
+                seller: seller.clone(),
+                buyer: buyer.clone(),
+                price,
+                token: token.clone(),
+                status: SwapStatus::Pending,
+                expiry: env.ledger().timestamp() + 604800u64,
+                accept_timestamp: 0,
+                required_approvals,
+                dispute_timestamp: 0,
+                referrer: referrer.clone(),
+                collateral_amount: 0,
+                insurance_premium: 0,
+                insurance_enabled: false,
+                escrow_agent: None,
+                quantity: 1,
+                conditions: Vec::new(&env),
+                paid_amount: 0,
+                is_installment: false,
+            };
 
             env.storage().persistent().set(&DataKey::Swap(id), &swap);
             env.storage().persistent().extend_ttl(&DataKey::Swap(id), LEDGER_BUMP, LEDGER_BUMP);
@@ -1787,6 +1896,17 @@ impl AtomicSwap {
 
             swap_ids.push_back(id);
         }
+
+        // #519: Emit batch-level initiated event
+        env.events().publish(
+            (soroban_sdk::symbol_short!("btch_ini"),),
+            BatchInitiatedEvent {
+                swap_ids: swap_ids.clone(),
+                seller,
+                buyer,
+                count: len as u32,
+            },
+        );
 
         swap_ids
     }
@@ -2761,8 +2881,17 @@ impl AtomicSwap {
         require_not_paused(&env);
         buyer.require_auth();
 
+        // #520: Validate batch parameters upfront
+        if swap_ids.is_empty() {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchEmpty as u32));
+        }
+        if swap_ids.len() > MAX_BATCH_SIZE {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchTooLarge as u32));
+        }
+
+        // #522: Pre-validation pass — no mutations; ensures full atomicity
         for swap_id in swap_ids.iter() {
-            let mut swap = require_swap_exists(&env, swap_id);
+            let swap = require_swap_exists(&env, swap_id);
 
             if swap.buyer != buyer {
                 env.panic_with_error(Error::from_contract_error(
@@ -2770,14 +2899,8 @@ impl AtomicSwap {
                 ));
             }
 
-            require_swap_status(
-                &env,
-                &swap,
-                SwapStatus::Pending,
-                ContractError::NotPending,
-            );
+            require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
 
-            // Check approvals
             if swap.required_approvals > 0 {
                 let approvals: Vec<Address> = env
                     .storage()
@@ -2790,21 +2913,20 @@ impl AtomicSwap {
                     ));
                 }
             }
+        }
 
-            // Deposit collateral if required
+        // Execution pass — all validations passed, safe to mutate
+        for swap_id in swap_ids.iter() {
+            let mut swap = require_swap_exists(&env, swap_id);
+
             if swap.collateral_amount > 0 {
-                if !env
-                    .storage()
-                    .persistent()
-                    .has(&DataKey::SwapCollateral(swap_id))
-                {
+                if !env.storage().persistent().has(&DataKey::SwapCollateral(swap_id)) {
                     let token_client = token::Client::new(&env, &swap.token);
                     token_client.transfer(
                         &swap.buyer,
                         &env.current_contract_address(),
                         &swap.collateral_amount,
                     );
-
                     env.storage()
                         .persistent()
                         .set(&DataKey::SwapCollateral(swap_id), &swap.collateral_amount);
@@ -2814,13 +2936,8 @@ impl AtomicSwap {
                 }
             }
 
-            // Transfer payment
             let token_client = token::Client::new(&env, &swap.token);
-            token_client.transfer(
-                &swap.buyer,
-                &env.current_contract_address(),
-                &swap.price,
-            );
+            token_client.transfer(&swap.buyer, &env.current_contract_address(), &swap.price);
 
             // #354: Collect insurance premium from buyer and add to pool.
             if swap.insurance_enabled && swap.insurance_premium > 0 {
@@ -2838,16 +2955,12 @@ impl AtomicSwap {
             swap.accept_timestamp = env.ledger().timestamp();
             swap.status = SwapStatus::Accepted;
             swap::save_swap(&env, swap_id, &swap);
-
             Self::append_history(&env, swap_id, SwapStatus::Accepted);
         }
 
         env.events().publish(
             (soroban_sdk::symbol_short!("btch_acp"),),
-            BatchAcceptedEvent {
-                swap_ids,
-                buyer,
-            },
+            BatchAcceptedEvent { swap_ids, buyer },
         );
     }
 
@@ -2862,46 +2975,45 @@ impl AtomicSwap {
     ) {
         seller.require_auth();
 
-        if swap_ids.len() != secrets.len() || swap_ids.len() != blinding_factors.len() {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::InvalidKey as u32,
-            ));
+        // #520: Validate batch parameters upfront
+        if swap_ids.is_empty() {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchEmpty as u32));
+        }
+        if secrets.len() != swap_ids.len() || blinding_factors.len() != swap_ids.len() {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchSizeMismatch as u32));
+        }
+        if swap_ids.len() > MAX_BATCH_SIZE {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchTooLarge as u32));
         }
 
         let mut fee_breakdowns: Vec<SwapFeeBreakdown> = Vec::new(&env);
 
         for i in 0..swap_ids.len() {
             let swap_id = swap_ids.get(i).unwrap();
-            let secret = secrets.get(i).unwrap();
-            let blinding_factor = blinding_factors.get(i).unwrap();
-
-            let mut swap = require_swap_exists(&env, swap_id);
-
+            let swap = require_swap_exists(&env, swap_id);
             require_seller(&env, &seller, &swap);
-            require_swap_status(
+            require_swap_status(&env, &swap, SwapStatus::Accepted, ContractError::NotAccepted);
+            let valid = registry::verify_commitment(
                 &env,
-                &swap,
-                SwapStatus::Accepted,
-                ContractError::NotAccepted,
+                swap.ip_id,
+                &secrets.get(i).unwrap(),
+                &blinding_factors.get(i).unwrap(),
             );
-
-            // Verify commitment
-            let valid = registry::verify_commitment(&env, swap.ip_id, &secret, &blinding_factor);
             if !valid {
-                env.panic_with_error(Error::from_contract_error(
-                    ContractError::InvalidKey as u32,
-                ));
+                env.panic_with_error(Error::from_contract_error(ContractError::InvalidKey as u32));
             }
+        }
+
+        // Execution pass — all keys verified, safe to release payments
+        for i in 0..swap_ids.len() {
+            let swap_id = swap_ids.get(i).unwrap();
+            let mut swap = require_swap_exists(&env, swap_id);
 
             swap.status = SwapStatus::Completed;
             swap::save_swap(&env, swap_id, &swap);
-            env.storage()
-                .persistent()
-                .remove(&DataKey::ActiveSwap(swap.ip_id));
-
+            env.storage().persistent().remove(&DataKey::ActiveSwap(swap.ip_id));
             Self::append_history(&env, swap_id, SwapStatus::Completed);
 
-            // Process payment
             let token_client = token::Client::new(&env, &swap.token);
             let config = Self::protocol_config(&env);
             let fee_bps = config.protocol_fee_bps as i128;
@@ -2931,11 +3043,7 @@ impl AtomicSwap {
             );
 
             if fee_amount > 0 {
-                token_client.transfer(
-                    &env.current_contract_address(),
-                    &config.treasury,
-                    &fee_amount,
-                );
+                token_client.transfer(&env.current_contract_address(), &config.treasury, &fee_amount);
             }
 
             // #518: Pay referral reward
@@ -2978,9 +3086,7 @@ impl AtomicSwap {
                         &swap.seller,
                         &collateral,
                     );
-                    env.storage()
-                        .persistent()
-                        .remove(&DataKey::SwapCollateral(swap_id));
+                    env.storage().persistent().remove(&DataKey::SwapCollateral(swap_id));
 
                     env.events().publish(
                         (soroban_sdk::symbol_short!("coll_rel"),),

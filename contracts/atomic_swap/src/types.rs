@@ -430,3 +430,22 @@ pub struct SwapRolledBackEvent {
     pub buyer_refund: i128,
     pub treasury_penalty: i128,
 }
+
+// ── #519: Batch Swap Events ───────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchInitiatedEvent {
+    pub swap_ids: Vec<u64>,
+    pub seller: Address,
+    pub buyer: Address,
+    pub count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchRollbackEvent {
+    pub swap_ids: Vec<u64>,
+    pub caller: Address,
+    pub count: u32,
+}
