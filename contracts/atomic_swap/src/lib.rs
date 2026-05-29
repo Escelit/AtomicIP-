@@ -3997,6 +3997,15 @@ include!("multi_signer_tests.rs");
 mod batch_swap_features_tests;
 
 #[cfg(test)]
+mod prop_tests;
+
+#[cfg(test)]
+mod benchmarks;
+
+#[cfg(test)]
+mod chaos_tests;
+
+#[cfg(test)]
 mod installment_tests {
     use super::*;
     use soroban_sdk::{testutils::Address as TestAddress, Env, Vec};
