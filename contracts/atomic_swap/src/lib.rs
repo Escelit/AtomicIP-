@@ -3960,6 +3960,171 @@ impl AtomicSwap {
             .persistent()
             .extend_ttl(&DataKey::UserReputation(address.clone()), LEDGER_BUMP, LEDGER_BUMP);
     }
+
+    // ── #515: Batch Escrow Arbitration ────────────────────────────────────────
+
+    /// Request arbitration for multiple disputed escrow swaps in one call.
+    ///
+    /// For each swap_id:
+    /// - Swap must be in `Disputed` status.
+    /// - Requester must be the buyer or seller of that swap.
+    /// - Records the arbitration timestamp (first request wins per swap).
+    ///
+    /// A single `evidence_hash` is shared across all swaps in the batch.
+    /// Emits `BatchEscrowArbitrationEvent` after processing all swaps.
+    pub fn batch_escrow_arbitration(
+        env: Env,
+        swap_ids: Vec<u64>,
+        requester: Address,
+        evidence_hash: BytesN<32>,
+    ) {
+        requester.require_auth();
+
+        let len = swap_ids.len();
+        if len == 0 {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchEmpty as u32));
+        }
+        if len > MAX_BATCH_SIZE {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchTooLarge as u32));
+        }
+
+        // Pre-validation pass: ensure all swaps are valid before mutating state
+        for swap_id in swap_ids.iter() {
+            let swap = require_swap_exists(&env, swap_id);
+            if requester != swap.buyer && requester != swap.seller {
+                env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
+            }
+            require_swap_status(&env, &swap, SwapStatus::Disputed, ContractError::NotDisputed);
+        }
+
+        // Execution pass: record arbitration timestamps
+        for swap_id in swap_ids.iter() {
+            if !env.storage().persistent().has(&DataKey::ArbitrationTimestamp(swap_id)) {
+                let ts = env.ledger().timestamp();
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::ArbitrationTimestamp(swap_id), &ts);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&DataKey::ArbitrationTimestamp(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+            }
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("arb_req"),),
+                ArbitrationRequestedEvent {
+                    swap_id,
+                    requester: requester.clone(),
+                    evidence_hash: evidence_hash.clone(),
+                },
+            );
+        }
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("btch_arb"),),
+            BatchEscrowArbitrationEvent {
+                swap_ids,
+                requester,
+                evidence_hash,
+                count: len as u32,
+            },
+        );
+    }
+
+    // ── #516: Batch Timeout Auto-Resolution ───────────────────────────────────
+
+    /// Auto-resolve multiple timed-out batch swaps in one call.
+    ///
+    /// For each swap_id:
+    /// - Swap must be in `Disputed` status.
+    /// - `ArbitrationTimestamp` must have been set via `request_arbitration` or
+    ///   `batch_escrow_arbitration`.
+    /// - `arbitration_timeout_seconds` must have elapsed since that timestamp.
+    ///
+    /// On success, each swap is cancelled and the buyer is refunded the escrowed
+    /// amount (from `EscrowDeposit` if present, otherwise `swap.price`).
+    /// Emits `BatchTimeoutAutoResolvedEvent` after processing all swaps.
+    pub fn batch_timeout_auto_resolve(env: Env, swap_ids: Vec<u64>) {
+        let len = swap_ids.len();
+        if len == 0 {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchEmpty as u32));
+        }
+        if len > MAX_BATCH_SIZE {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchTooLarge as u32));
+        }
+
+        let config = Self::protocol_config(&env);
+
+        // Pre-validation pass: ensure all swaps are eligible before mutating state
+        for swap_id in swap_ids.iter() {
+            let swap = require_swap_exists(&env, swap_id);
+            require_swap_status(&env, &swap, SwapStatus::Disputed, ContractError::NotDisputed);
+
+            let arb_ts: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ArbitrationTimestamp(swap_id))
+                .unwrap_or_else(|| {
+                    env.panic_with_error(Error::from_contract_error(ContractError::NotDisputed as u32))
+                });
+
+            let elapsed = env.ledger().timestamp().saturating_sub(arb_ts);
+            if elapsed < config.arbitration_timeout_seconds {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::ArbitrationNotTimedOut as u32,
+                ));
+            }
+        }
+
+        // Execution pass: cancel each swap and refund buyers
+        for swap_id in swap_ids.iter() {
+            let mut swap = require_swap_exists(&env, swap_id);
+
+            swap.status = SwapStatus::Cancelled;
+            swap::save_swap(&env, swap_id, &swap);
+            env.storage().persistent().remove(&DataKey::ActiveSwap(swap.ip_id));
+            env.storage().persistent().remove(&DataKey::ArbitrationTimestamp(swap_id));
+
+            // Refund from escrow deposit if present, otherwise from swap price
+            let refund_amount: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::EscrowDeposit(swap_id))
+                .unwrap_or(swap.price);
+
+            if refund_amount > 0 {
+                token::Client::new(&env, &swap.token).transfer(
+                    &env.current_contract_address(),
+                    &swap.buyer,
+                    &refund_amount,
+                );
+            }
+
+            env.storage().persistent().remove(&DataKey::EscrowDeposit(swap_id));
+
+            env.storage().persistent().set(
+                &DataKey::CancelReason(swap_id),
+                &Bytes::from_slice(&env, b"batch_arbitration_timeout"),
+            );
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::CancelReason(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            Self::append_history(&env, swap_id, SwapStatus::Cancelled);
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("arb_tout"),),
+                DisputeResolvedEvent { swap_id, refunded: true },
+            );
+        }
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("btch_tor"),),
+            BatchTimeoutAutoResolvedEvent {
+                swap_ids,
+                count: len as u32,
+            },
+        );
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

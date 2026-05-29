@@ -451,3 +451,23 @@ pub struct BatchRollbackEvent {
     pub caller: Address,
     pub count: u32,
 }
+
+// ── #515: Batch Escrow Arbitration Event ─────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchEscrowArbitrationEvent {
+    pub swap_ids: Vec<u64>,
+    pub requester: Address,
+    pub evidence_hash: BytesN<32>,
+    pub count: u32,
+}
+
+// ── #516: Batch Timeout Auto-Resolve Event ────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchTimeoutAutoResolvedEvent {
+    pub swap_ids: Vec<u64>,
+    pub count: u32,
+}
