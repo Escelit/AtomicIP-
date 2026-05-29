@@ -62,3 +62,20 @@ Mutation testing was run against the current codebase. All mutants in the
 core validation paths (`require_non_zero_commitment`, `require_unique_commitment`,
 `require_positive_price`, status transition assignments) are killed by the
 `mutation_tests` module.
+
+## CI/CD Integration (#556)
+
+Mutation testing runs automatically via `.github/workflows/mutation.yml`:
+
+| Trigger              | Scope                              |
+|----------------------|------------------------------------|
+| Pull request         | Only lines changed in the PR diff (`--in-diff`) — fast |
+| Weekly schedule (Mon)| Full sweep over both contracts     |
+| Manual dispatch      | Full sweep                         |
+
+The PR-scoped run keeps feedback fast while ensuring new/changed logic is
+covered by mutation-killing tests. The full report is uploaded as the
+`mutants-report` build artifact (`mutants.out/`).
+
+If a PR introduces a **surviving** mutant, add a test (typically in
+`src/mutation_tests.rs`) that fails for that mutation, then re-run.

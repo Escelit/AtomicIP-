@@ -122,6 +122,10 @@ Latest testnet deployment addresses are published in GitHub Actions deployment s
 - [API Reference](docs/api-reference.md)
 - [Changelog Format](docs/changelog-format.md)
 - [Security Policy](SECURITY.md)
+- [Security Scanning (CI/CD)](docs/security-scanning.md)
+- [Dependency Vulnerability Scanning](docs/dependency-scanning.md)
+- [Code Coverage Enforcement](docs/code-coverage.md)
+- [Mutation Testing](docs/mutation-testing.md)
 - [Roadmap](docs/roadmap.md)
 
 ## 📦 Release Notes and Changelog
