@@ -220,3 +220,83 @@ swap_contract.reveal_key(swap_id, secret, blinding_factor);
 - [Commitment Scheme](commitment-scheme.md) — How to construct valid secrets
 - [Security Considerations](security.md) — Best practices for key management
 - [Threat Model](threat-model.md) — Attack vectors and mitigations
+
+---
+
+## Multi-Signer Swaps and Batch Verification
+
+For high-value IP sales that require sign-off from multiple co-inventors or stakeholders, the contract supports a multi-signer reveal flow.
+
+### Initiating a Multi-Signer Swap
+
+```rust
+let swap_id = atomic_swap.initiate_swap_with_signers(
+    token,
+    ip_id,
+    seller,
+    price,
+    buyer,
+    signers, // Vec<Address> — all must sign before reveal_key is allowed
+);
+```
+
+The `signers` list must be non-empty. All addresses in the list must call `sign_swap_reveal` (or `batch_sign_swap_reveal`) before the seller can call `reveal_key`.
+
+### Signing Off (Single Swap)
+
+```rust
+atomic_swap.sign_swap_reveal(swap_id, signer);
+```
+
+- Swap must be in `Accepted` state.
+- `signer` must be in the required signers list.
+- Duplicate signatures are rejected.
+
+### Batch Signing (Multiple Swaps)
+
+A signer can approve multiple swaps in a single transaction:
+
+```rust
+atomic_swap.batch_sign_swap_reveal(swap_ids, signer);
+```
+
+- Applies the same checks as `sign_swap_reveal` for each swap.
+- Emits a `BatchSignedEvent { swap_ids, signer }`.
+- Fails atomically if any swap fails validation (wrong state, not a required signer, duplicate).
+
+### Querying Signature Status
+
+```rust
+let (signed_count, required_count) = atomic_swap.get_swap_signature_status(swap_id);
+```
+
+Returns `(0, 0)` for swaps with no multi-signer requirement.
+
+### Batch Reveal with Multi-Signer Guard
+
+`batch_reveal_keys` enforces the same multi-signer guard as `reveal_key` — if a swap has required signers, all must have signed before the batch reveal proceeds. Any swap in the batch that has unsigned signers will cause the entire batch call to fail.
+
+### Example: Two Co-Inventors
+
+```rust
+// Seller and co-inventor must both approve before reveal
+let mut signers = Vec::new(&env);
+signers.push_back(seller.clone());
+signers.push_back(co_inventor.clone());
+
+let swap_id = atomic_swap.initiate_swap_with_signers(
+    token, ip_id, seller, price, buyer, signers,
+);
+
+// Buyer accepts and sends payment
+atomic_swap.accept_swap(swap_id);
+
+// Both signers approve (can be done in one batch call)
+let mut ids = Vec::new(&env);
+ids.push_back(swap_id);
+atomic_swap.batch_sign_swap_reveal(ids.clone(), seller);
+atomic_swap.batch_sign_swap_reveal(ids, co_inventor);
+
+// Now reveal is unblocked
+atomic_swap.reveal_key(swap_id, seller, secret, blinding_factor);
+```

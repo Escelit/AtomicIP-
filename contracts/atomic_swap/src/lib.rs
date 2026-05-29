@@ -2717,6 +2717,25 @@ impl AtomicSwap {
                 ContractError::NotAccepted,
             );
 
+            // Guard: if this swap has required signers, all must have signed before reveal.
+            if env.storage().persistent().has(&DataKey::SwapSigners(swap_id)) {
+                let signers: Vec<Address> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::SwapSigners(swap_id))
+                    .unwrap_or(Vec::new(&env));
+                let signed: Vec<Address> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::SwapSignatures(swap_id))
+                    .unwrap_or(Vec::new(&env));
+                if signed.len() < signers.len() {
+                    env.panic_with_error(Error::from_contract_error(
+                        ContractError::NotAllSigned as u32,
+                    ));
+                }
+            }
+
             // Verify commitment
             let valid = registry::verify_commitment(&env, swap.ip_id, &secret, &blinding_factor);
             if !valid {
@@ -3160,6 +3179,8 @@ impl AtomicSwap {
             escrow_agent: None,
             quantity: 1,
             conditions: Vec::new(&env),
+            paid_amount: 0,
+            is_installment: false,
         };
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -3245,6 +3266,83 @@ impl AtomicSwap {
         env.storage().persistent().extend_ttl(&DataKey::SwapSignatures(swap_id), LEDGER_BUMP, LEDGER_BUMP);
     }
 
+    /// A required signer signs off on multiple swaps in a single call.
+    /// Equivalent to calling `sign_swap_reveal` for each swap_id individually.
+    pub fn batch_sign_swap_reveal(env: Env, swap_ids: Vec<u64>, signer: Address) {
+        signer.require_auth();
+
+        for swap_id in swap_ids.iter() {
+            let swap = require_swap_exists(&env, swap_id);
+            require_swap_status(&env, &swap, SwapStatus::Accepted, ContractError::NotAccepted);
+
+            let signers: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SwapSigners(swap_id))
+                .unwrap_or_else(|| {
+                    env.panic_with_error(Error::from_contract_error(
+                        ContractError::Unauthorized as u32,
+                    ))
+                });
+
+            let mut is_required = false;
+            for i in 0..signers.len() {
+                if signers.get(i).unwrap() == signer {
+                    is_required = true;
+                    break;
+                }
+            }
+            if !is_required {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NotARequiredSigner as u32,
+                ));
+            }
+
+            let mut signed: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SwapSignatures(swap_id))
+                .unwrap_or(Vec::new(&env));
+
+            for i in 0..signed.len() {
+                if signed.get(i).unwrap() == signer {
+                    env.panic_with_error(Error::from_contract_error(
+                        ContractError::AlreadySigned as u32,
+                    ));
+                }
+            }
+
+            signed.push_back(signer.clone());
+            env.storage().persistent().set(&DataKey::SwapSignatures(swap_id), &signed);
+            env.storage().persistent().extend_ttl(&DataKey::SwapSignatures(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+        }
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("btch_sgn"),),
+            BatchSignedEvent { swap_ids, signer },
+        );
+    }
+
+    /// Returns (signed_count, required_count) for a swap.
+    /// Returns (0, 0) if the swap has no multi-signer requirement.
+    pub fn get_swap_signature_status(env: Env, swap_id: u64) -> (u32, u32) {
+        let _ = require_swap_exists(&env, swap_id);
+        if !env.storage().persistent().has(&DataKey::SwapSigners(swap_id)) {
+            return (0, 0);
+        }
+        let signers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SwapSigners(swap_id))
+            .unwrap_or(Vec::new(&env));
+        let signed: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SwapSignatures(swap_id))
+            .unwrap_or(Vec::new(&env));
+        (signed.len(), signers.len())
+    }
+
     // ── Reputation ────────────────────────────────────────────────────────────
 
     /// Returns the reputation score (0–100) for an address. Defaults to 50.
@@ -3315,6 +3413,8 @@ impl AtomicSwap {
 
 // #[cfg(test)]
 // mod upgrade_chaos_tests;
+
+include!("multi_signer_tests.rs");
 
 #[cfg(test)]
 mod installment_tests {

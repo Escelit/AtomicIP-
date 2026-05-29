@@ -346,6 +346,14 @@ pub struct BatchKeysRevealedEvent {
     pub seller: Address,
 }
 
+/// Emitted when a signer signs off on multiple swaps via `batch_sign_swap_reveal`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchSignedEvent {
+    pub swap_ids: Vec<u64>,
+    pub signer: Address,
+}
+
 // ── #358: Timeout Escalation Event ────────────────────────────────────────────
 
 #[contracttype]
