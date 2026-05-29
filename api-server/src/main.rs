@@ -27,6 +27,10 @@ mod request_signing;
 mod invariants;
 mod health;
 mod compression;
+mod fallback;
+mod distributed_tracing;
+mod error_recovery;
+mod request_queue;
 
 #[derive(OpenApi)]
 #[openapi(
