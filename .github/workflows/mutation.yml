@@ -28,7 +28,7 @@ jobs:
     name: cargo-mutants
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # Need the base ref to compute the PR diff for incremental runs.
           fetch-depth: 0
