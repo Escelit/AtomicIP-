@@ -2426,6 +2426,84 @@ impl AtomicSwap {
 
     // ── Installment Payments ──────────────────────────────────────────────────
 
+    /// Seller initiates a swap that the buyer may pay in installments.
+    ///
+    /// The swap is created in `Pending` state with `is_installment = true`.
+    /// The buyer calls `submit_installment_payment` one or more times until
+    /// `paid_amount >= price`, at which point the swap transitions to `Accepted`
+    /// and the seller can reveal the decryption key.
+    ///
+    /// `num_installments` is informational (stored as a hint for the buyer) and
+    /// does not enforce a maximum number of payments.
+    pub fn initiate_swap_installment(
+        env: Env,
+        token: Address,
+        ip_id: u64,
+        seller: Address,
+        price: i128,
+        buyer: Address,
+        num_installments: u32,
+    ) -> u64 {
+        require_not_paused(&env);
+        seller.require_auth();
+        require_positive_price(&env, price);
+        if num_installments == 0 {
+            env.panic_with_error(Error::from_contract_error(ContractError::PriceTooSmall as u32));
+        }
+        registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
+        require_no_active_swap(&env, ip_id);
+
+        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
+
+        let swap = SwapRecord {
+            ip_id,
+            seller: seller.clone(),
+            buyer: buyer.clone(),
+            price,
+            token: token.clone(),
+            status: SwapStatus::Pending,
+            expiry: env.ledger().timestamp() + 604800u64,
+            accept_timestamp: 0,
+            required_approvals: 0,
+            dispute_timestamp: 0,
+            referrer: None,
+            collateral_amount: 0,
+            insurance_premium: 0,
+            insurance_enabled: false,
+            escrow_agent: None,
+            quantity: num_installments,
+            conditions: Vec::new(&env),
+            paid_amount: 0,
+            is_installment: true,
+        };
+
+        env.storage().persistent().set(&DataKey::Swap(id), &swap);
+        env.storage().persistent().extend_ttl(&DataKey::Swap(id), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage().persistent().set(&DataKey::ActiveSwap(ip_id), &id);
+        env.storage().persistent().extend_ttl(&DataKey::ActiveSwap(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        swap::append_swap_for_party(&env, &seller, &buyer, id);
+
+        let mut ip_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpSwaps(ip_id))
+            .unwrap_or(Vec::new(&env));
+        ip_ids.push_back(id);
+        env.storage().persistent().set(&DataKey::IpSwaps(ip_id), &ip_ids);
+        env.storage().persistent().extend_ttl(&DataKey::IpSwaps(ip_id), 50000, 50000);
+
+        Self::append_history(&env, id, SwapStatus::Pending);
+        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+
+        env.events().publish(
+            (symbol_short!("swap_init"),),
+            SwapInitiatedEvent { swap_id: id, ip_id, seller, buyer, price },
+        );
+
+        id
+    }
+
     /// Submit an installment payment toward a scheduled swap. Buyer-only.
     ///
     /// Transfers `payment_amount` tokens from buyer to escrow and accumulates
@@ -4173,7 +4251,7 @@ mod chaos_tests;
 #[cfg(test)]
 mod installment_tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as TestAddress, Env, Vec};
+    use soroban_sdk::{testutils::Address as TestAddress, BytesN, Env, Vec};
 
     fn make_swap(env: &Env, price: i128, paid: i128, is_installment: bool) -> SwapRecord {
         SwapRecord {
@@ -4335,6 +4413,132 @@ mod installment_tests {
 
         // remaining is 100, paying 200 should panic
         client.submit_installment_payment(&0u64, &200);
+    }
+
+    // ── #466: initiate_swap_installment tests ─────────────────────────────────
+
+    #[test]
+    fn test_initiate_swap_installment_creates_pending_installment_swap() {
+        use ip_registry::{IpRegistry, IpRegistryClient};
+        use soroban_sdk::token::StellarAssetClient;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = <soroban_sdk::Address as TestAddress>::generate(&env);
+        let buyer = <soroban_sdk::Address as TestAddress>::generate(&env);
+        let admin = <soroban_sdk::Address as TestAddress>::generate(&env);
+
+        let registry_id = env.register(IpRegistry, ());
+        let registry = IpRegistryClient::new(&env, &registry_id);
+        let secret = BytesN::from_array(&env, &[2u8; 32]);
+        let blinding = BytesN::from_array(&env, &[3u8; 32]);
+        let mut preimage = soroban_sdk::Bytes::new(&env);
+        preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
+        preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
+        let commitment_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+        let ip_id = registry.commit_ip(&seller, &commitment_hash);
+
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        StellarAssetClient::new(&env, &token_id).mint(&buyer, &1000);
+
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+        client.initialize(&registry_id);
+
+        let swap_id = client.initiate_swap_installment(&token_id, &ip_id, &seller, &600_i128, &buyer, &3_u32);
+
+        let swap = client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.status, SwapStatus::Pending);
+        assert!(swap.is_installment);
+        assert_eq!(swap.price, 600);
+        assert_eq!(swap.paid_amount, 0);
+        assert_eq!(swap.quantity, 3);
+    }
+
+    #[test]
+    fn test_initiate_swap_installment_then_pay_in_parts() {
+        use ip_registry::{IpRegistry, IpRegistryClient};
+        use soroban_sdk::token::StellarAssetClient;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = <soroban_sdk::Address as TestAddress>::generate(&env);
+        let buyer = <soroban_sdk::Address as TestAddress>::generate(&env);
+        let admin = <soroban_sdk::Address as TestAddress>::generate(&env);
+
+        let registry_id = env.register(IpRegistry, ());
+        let registry = IpRegistryClient::new(&env, &registry_id);
+        let secret = BytesN::from_array(&env, &[2u8; 32]);
+        let blinding = BytesN::from_array(&env, &[3u8; 32]);
+        let mut preimage = soroban_sdk::Bytes::new(&env);
+        preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
+        preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
+        let commitment_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+        let ip_id = registry.commit_ip(&seller, &commitment_hash);
+
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        StellarAssetClient::new(&env, &token_id).mint(&buyer, &1000);
+
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+        client.initialize(&registry_id);
+
+        let swap_id = client.initiate_swap_installment(&token_id, &ip_id, &seller, &300_i128, &buyer, &3_u32);
+
+        // First installment
+        client.submit_installment_payment(&swap_id, &100);
+        let (paid, total, remaining) = client.get_installment_status(&swap_id);
+        assert_eq!(paid, 100);
+        assert_eq!(total, 300);
+        assert_eq!(remaining, 200);
+
+        // Second installment
+        client.submit_installment_payment(&swap_id, &100);
+        let (paid, _, remaining) = client.get_installment_status(&swap_id);
+        assert_eq!(paid, 200);
+        assert_eq!(remaining, 100);
+
+        // Final installment — should transition to Accepted
+        client.submit_installment_payment(&swap_id, &100);
+        let swap = client.get_swap(&swap_id).unwrap();
+        assert_eq!(swap.status, SwapStatus::Accepted);
+        assert_eq!(swap.paid_amount, 300);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_initiate_swap_installment_zero_installments_panics() {
+        use ip_registry::{IpRegistry, IpRegistryClient};
+        use soroban_sdk::token::StellarAssetClient;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = <soroban_sdk::Address as TestAddress>::generate(&env);
+        let buyer = <soroban_sdk::Address as TestAddress>::generate(&env);
+        let admin = <soroban_sdk::Address as TestAddress>::generate(&env);
+
+        let registry_id = env.register(IpRegistry, ());
+        let registry = IpRegistryClient::new(&env, &registry_id);
+        let secret = BytesN::from_array(&env, &[2u8; 32]);
+        let blinding = BytesN::from_array(&env, &[3u8; 32]);
+        let mut preimage = soroban_sdk::Bytes::new(&env);
+        preimage.append(&soroban_sdk::Bytes::from(secret.clone()));
+        preimage.append(&soroban_sdk::Bytes::from(blinding.clone()));
+        let commitment_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+        let ip_id = registry.commit_ip(&seller, &commitment_hash);
+
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        StellarAssetClient::new(&env, &token_id).mint(&buyer, &1000);
+
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+        client.initialize(&registry_id);
+
+        // num_installments = 0 should panic
+        client.initiate_swap_installment(&token_id, &ip_id, &seller, &300_i128, &buyer, &0_u32);
     }
 }
 
