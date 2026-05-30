@@ -2311,3 +2311,146 @@ mod tests {
         assert_eq!(id4, 4);
     }
 }
+
+// ── Expiry & Grace Period Tests ───────────────────────────────────────────────
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+    use soroban_sdk::{testutils::{Address as _, Ledger}, BytesN, Env, Vec};
+
+    fn setup() -> (Env, IpRegistryClient<'static>, Address, u64) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xAAu8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+        (env, client, owner, ip_id)
+    }
+
+    #[test]
+    fn test_set_ip_expiry_stores_fields() {
+        let (env, client, _owner, ip_id) = setup();
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 1000), &300);
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.expiry_timestamp, now + 1000);
+        assert_eq!(record.grace_period_seconds, 300);
+    }
+
+    #[test]
+    fn test_renew_ip_commitment_extends_expiry() {
+        let (env, client, _owner, ip_id) = setup();
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 1000), &300);
+        let result = client.renew_ip_commitment(&ip_id, &(now + 2000));
+        assert!(result);
+        assert_eq!(client.get_ip(&ip_id).expiry_timestamp, now + 2000);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_renew_ip_commitment_lower_expiry_panics() {
+        let (env, client, _owner, ip_id) = setup();
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 1000), &300);
+        // new_expiry <= current expiry → must panic
+        client.renew_ip_commitment(&ip_id, &(now + 500));
+    }
+
+    #[test]
+    fn test_cleanup_removes_ip_past_grace_period() {
+        let (env, client, _owner, ip_id) = setup();
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 100), &50);
+
+        // Advance time past expiry + grace
+        env.ledger().with_mut(|l| l.timestamp = now + 200);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(ip_id);
+        client.cleanup_expired_ips(&ids);
+
+        // Record should be gone
+        assert!(client.try_get_ip(&ip_id).is_err());
+    }
+
+    #[test]
+    fn test_cleanup_skips_ip_within_grace_period() {
+        let (env, client, _owner, ip_id) = setup();
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 100), &200);
+
+        // Advance past expiry but still within grace
+        env.ledger().with_mut(|l| l.timestamp = now + 150);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(ip_id);
+        client.cleanup_expired_ips(&ids);
+
+        // Record should still exist
+        assert_eq!(client.get_ip(&ip_id).ip_id, ip_id);
+    }
+
+    #[test]
+    fn test_cleanup_skips_ip_with_no_expiry() {
+        let (env, client, _owner, ip_id) = setup();
+        // No expiry set (expiry_timestamp == 0)
+        env.ledger().with_mut(|l| l.timestamp = 9_999_999);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(ip_id);
+        client.cleanup_expired_ips(&ids);
+
+        // Record must still exist
+        assert_eq!(client.get_ip(&ip_id).ip_id, ip_id);
+    }
+
+    #[test]
+    fn test_renew_emits_event() {
+        let (env, client, _owner, ip_id) = setup();
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 1000), &0);
+        client.renew_ip_commitment(&ip_id, &(now + 2000));
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            if let Ok(t) = soroban_sdk::Vec::<soroban_sdk::Val>::try_from_val(&env, &topics) {
+                if let Some(v) = t.get(0) {
+                    if let Ok(s) = soroban_sdk::Symbol::try_from_val(&env, &v) {
+                        return s == soroban_sdk::symbol_short!("ip_renew");
+                    }
+                }
+            }
+            false
+        });
+        assert!(found, "ip_renew event must be emitted");
+    }
+
+    #[test]
+    fn test_cleanup_emits_event() {
+        let (env, client, _owner, ip_id) = setup();
+        let now = env.ledger().timestamp();
+        client.set_ip_expiry(&ip_id, &(now + 100), &0);
+        env.ledger().with_mut(|l| l.timestamp = now + 200);
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(ip_id);
+        client.cleanup_expired_ips(&ids);
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            if let Ok(t) = soroban_sdk::Vec::<soroban_sdk::Val>::try_from_val(&env, &topics) {
+                if let Some(v) = t.get(0) {
+                    if let Ok(s) = soroban_sdk::Symbol::try_from_val(&env, &v) {
+                        return s == soroban_sdk::symbol_short!("ip_clean");
+                    }
+                }
+            }
+            false
+        });
+        assert!(found, "ip_clean event must be emitted");
+    }
+}
