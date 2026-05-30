@@ -426,6 +426,8 @@ impl IpRegistry {
             co_owners: Vec::new(&env),
             parent_ip_id: None,
             notary_signature: None,
+            expiry_timestamp: 0,
+            grace_period_seconds: 0,
         };
 
         env.storage()
@@ -573,6 +575,8 @@ impl IpRegistry {
                 co_owners: Vec::new(&env),
                 parent_ip_id: None,
                 notary_signature: None,
+                expiry_timestamp: 0,
+                grace_period_seconds: 0,
             };
 
             env.storage()
@@ -1673,6 +1677,8 @@ impl IpRegistry {
                     co_owners: Vec::new(&env),
                     parent_ip_id: Some(parent_ip_id),
                     notary_signature: None,
+                    expiry_timestamp: 0,
+                    grace_period_seconds: 0,
                 };
 
         // Store the new version
@@ -3048,6 +3054,7 @@ impl IpRegistry {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound))
     }
 
+<<<<<<< HEAD
     // ── Issue #447: IP Commitment Staking ─────────────────────────────────────
 
     /// Stake XLM (represented as an i128 amount) against an IP commitment.
@@ -3933,6 +3940,67 @@ impl IpRegistry {
                 (symbol_short!("renewed"), owner.clone()),
                 (ip_id, new_count),
             );
+=======
+    // ── IP Expiry & Grace Period ───────────────────────────────────────────────
+
+    /// Set expiry and grace period for an IP. Owner-only.
+    /// Pass expiry_timestamp = 0 to remove expiry.
+    pub fn set_ip_expiry(env: Env, ip_id: u64, expiry_timestamp: u64, grace_period_seconds: u64) {
+        let mut record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        if expiry_timestamp != 0 && expiry_timestamp <= env.ledger().timestamp() {
+            env.panic_with_error(Error::from_contract_error(ContractError::InvalidExpiry as u32));
+        }
+
+        record.expiry_timestamp = expiry_timestamp;
+        record.grace_period_seconds = grace_period_seconds;
+        env.storage().persistent().set(&DataKey::IpRecord(ip_id), &record);
+        env.storage().persistent().extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    /// Renew an IP commitment's expiry. Owner-only.
+    /// new_expiry must be strictly greater than the current expiry_timestamp.
+    pub fn renew_ip_commitment(env: Env, ip_id: u64, new_expiry: u64) -> bool {
+        let mut record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        if new_expiry <= record.expiry_timestamp {
+            env.panic_with_error(Error::from_contract_error(ContractError::InvalidExpiry as u32));
+        }
+
+        let old_expiry = record.expiry_timestamp;
+        record.expiry_timestamp = new_expiry;
+        env.storage().persistent().set(&DataKey::IpRecord(ip_id), &record);
+        env.storage().persistent().extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("ip_renew"), record.owner),
+            (ip_id, old_expiry, new_expiry),
+        );
+
+        true
+    }
+
+    /// Remove expired IPs that are past their grace period. Anyone can call.
+    /// Skips IPs with expiry_timestamp == 0 (no expiry set).
+    pub fn cleanup_expired_ips(env: Env, ip_ids: Vec<u64>) {
+        let now = env.ledger().timestamp();
+        for ip_id in ip_ids.iter() {
+            let record: Option<IpRecord> = env.storage().persistent().get(&DataKey::IpRecord(ip_id));
+            if let Some(rec) = record {
+                if rec.expiry_timestamp == 0 {
+                    continue;
+                }
+                if now >= rec.expiry_timestamp.saturating_add(rec.grace_period_seconds) {
+                    env.storage().persistent().remove(&DataKey::IpRecord(ip_id));
+                    env.events().publish(
+                        (symbol_short!("ip_clean"),),
+                        (ip_id, now),
+                    );
+                }
+            }
+>>>>>>> 6af3b64dbbf925a3937a2822b5ba7f5180df96ee
         }
     }
 }
