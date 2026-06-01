@@ -70,6 +70,12 @@ pub enum ContractError {
     OraclePriceInvalid = 47,
     OraclePriceBelowMin = 48,
     OraclePriceAboveMax = 49,
+    /// #314: Arbitration errors
+    ArbitratorAlreadySet = 35,
+    NotArbitrator = 36,
+    NoArbitratorSet = 37,
+    /// #313: Dispute evidence errors
+    UnauthorizedEvidenceSubmitter = 38,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -159,6 +165,10 @@ pub enum DataKey {
     CompletionTimestamp(u64),
     /// #470: Price oracle configuration (oracle contract address + enabled flag).
     OracleConfig,
+    /// #314: Maps swap_id → arbitrator Address for dispute resolution.
+    SwapArbitrator(u64),
+    /// #313: Maps swap_id → Vec<BytesN<32>> of dispute evidence hashes.
+    DisputeEvidence(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -227,6 +237,8 @@ pub struct SwapRecord {
     pub paid_amount: i128,
     /// #installments: Whether this swap uses an installment payment schedule.
     pub is_installment: bool,
+    /// #314: Optional arbitrator address for dispute resolution.
+    pub arbitrator: Option<Address>,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -395,6 +407,7 @@ impl AtomicSwap {
             conditions: Vec::new(&env),
             paid_amount: 0,
             is_installment: false,
+            arbitrator: None,
         };
 
         // Store insurance premium in dedicated key so accept_swap can collect it
@@ -1089,9 +1102,130 @@ impl AtomicSwap {
 
     // ── #314: Third-Party Arbitration ─────────────────────────────────────────
 
-    // set_arbitrator removed - arbitrator field not in SwapRecord
+    /// Admin sets an arbitrator for a disputed swap. Can only be set once.
+    pub fn set_arbitrator(env: Env, swap_id: u64, admin: Address, arbitrator: Address) {
+        admin.require_auth();
+        require_admin(&env, &admin);
 
-    // arbitrate_dispute removed - arbitrator field not in SwapRecord
+        let mut swap = require_swap_exists(&env, swap_id);
+        require_swap_status(&env, &swap, SwapStatus::Disputed, ContractError::NotDisputed);
+
+        if env.storage().persistent().has(&DataKey::SwapArbitrator(swap_id)) {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::ArbitratorAlreadySet as u32,
+            ));
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SwapArbitrator(swap_id), &arbitrator);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::SwapArbitrator(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        swap.arbitrator = Some(arbitrator.clone());
+        swap::save_swap(&env, swap_id, &swap);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("arb_set"),),
+            ArbitratorSetEvent { swap_id, arbitrator },
+        );
+    }
+
+    /// Arbitrator resolves a disputed swap. refund=true refunds buyer; false completes to seller.
+    pub fn arbitrate_dispute(env: Env, swap_id: u64, arbitrator: Address, refund: bool) {
+        arbitrator.require_auth();
+
+        let stored_arbitrator: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SwapArbitrator(swap_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NoArbitratorSet as u32,
+                ))
+            });
+
+        if arbitrator != stored_arbitrator {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::NotArbitrator as u32,
+            ));
+        }
+
+        let mut swap = require_swap_exists(&env, swap_id);
+        require_swap_status(&env, &swap, SwapStatus::Disputed, ContractError::NotDisputed);
+
+        let token_client = token::Client::new(&env, &swap.token);
+
+        if refund {
+            token_client.transfer(&env.current_contract_address(), &swap.buyer, &swap.price);
+            swap.status = SwapStatus::Cancelled;
+        } else {
+            let config = Self::protocol_config(&env);
+            let fee_amount = if config.protocol_fee_bps > 0 {
+                (swap.price * config.protocol_fee_bps as i128) / 10000
+            } else {
+                0
+            };
+            let seller_amount = swap.price - fee_amount;
+            if fee_amount > 0 {
+                token_client.transfer(&env.current_contract_address(), &config.treasury, &fee_amount);
+            }
+            token_client.transfer(&env.current_contract_address(), &swap.seller, &seller_amount);
+            swap.status = SwapStatus::Completed;
+        }
+
+        swap::save_swap(&env, swap_id, &swap);
+        env.storage().persistent().remove(&DataKey::ActiveSwap(swap.ip_id));
+        env.storage().persistent().remove(&DataKey::SwapArbitrator(swap_id));
+
+        Self::append_history(&env, swap_id, swap.status.clone());
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("arb_dec"),),
+            ArbitratedEvent { swap_id, arbitrator, refunded: refund },
+        );
+    }
+
+    /// Buyer or seller submits dispute evidence (a hash of off-chain evidence).
+    pub fn submit_dispute_evidence(
+        env: Env,
+        swap_id: u64,
+        submitter: Address,
+        evidence_hash: BytesN<32>,
+    ) {
+        submitter.require_auth();
+        let swap = require_swap_exists(&env, swap_id);
+
+        if submitter != swap.buyer && submitter != swap.seller {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::UnauthorizedEvidenceSubmitter as u32,
+            ));
+        }
+
+        let key = DataKey::DisputeEvidence(swap_id);
+        let mut evidence: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+        evidence.push_back(evidence_hash.clone());
+        env.storage().persistent().set(&key, &evidence);
+        env.storage().persistent().extend_ttl(&key, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("evid_sub"),),
+            DisputeEvidenceSubmittedEvent { swap_id, submitter, evidence_hash },
+        );
+    }
+
+    /// Returns all dispute evidence hashes submitted for a swap.
+    pub fn get_dispute_evidence(env: Env, swap_id: u64) -> Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeEvidence(swap_id))
+            .unwrap_or(Vec::new(&env))
+    }
 
     // submit_dispute_evidence removed - DisputeEvidence DataKey variant not defined
     // get_dispute_evidence removed - DisputeEvidence DataKey variant not defined
@@ -1862,6 +1996,7 @@ impl AtomicSwap {
                 conditions: Vec::new(&env),
                 paid_amount: 0,
                 is_installment: false,
+                arbitrator: None,
             };
 
             env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -2143,6 +2278,7 @@ impl AtomicSwap {
                 conditions: Vec::new(&env),
             paid_amount: 0,
             is_installment: false,
+            arbitrator: None,
             };
 
             env.storage()
@@ -2689,8 +2825,6 @@ impl AtomicSwap {
         arbitrator.require_auth();
 
         // Verify arbitrator is set and matches
-        // SwapArbitrator DataKey variant not defined - commenting out
-        /*
         let stored_arbitrator: Address = env
             .storage()
             .persistent()
@@ -2706,7 +2840,6 @@ impl AtomicSwap {
                 ContractError::NotArbitrator as u32,
             ));
         }
-        */
 
         let token_client = token::Client::new(&env, &swap.token);
 
@@ -2797,8 +2930,7 @@ impl AtomicSwap {
         env.storage()
             .persistent()
             .remove(&DataKey::ActiveSwap(swap.ip_id));
-        // SwapArbitrator DataKey variant not defined
-        // env.storage().persistent().remove(&DataKey::SwapArbitrator(swap_id));
+        env.storage().persistent().remove(&DataKey::SwapArbitrator(swap_id));
 
         env.events().publish(
             (soroban_sdk::symbol_short!("arb_dec"),),
@@ -3326,6 +3458,7 @@ impl AtomicSwap {
                 conditions: Vec::new(&env),
                 paid_amount: 0,
                 is_installment: false,
+                arbitrator: None,
             };
 
             if insurance_enabled {
@@ -3483,6 +3616,7 @@ impl AtomicSwap {
             conditions: Vec::new(&env),
             paid_amount: 0,
             is_installment: false,
+            arbitrator: None,
         };
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -3558,6 +3692,7 @@ impl AtomicSwap {
                 conditions: Vec::new(&env),
                 paid_amount: 0,
                 is_installment: false,
+                arbitrator: None,
             };
 
             env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -3846,6 +3981,7 @@ impl AtomicSwap {
             conditions: Vec::new(&env),
             paid_amount: 0,
             is_installment: false,
+            arbitrator: None,
         };
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -4211,16 +4347,10 @@ impl AtomicSwap {
 // mod tests;
 
 // #[cfg(test)]
-// mod escrow_tests;
-
-// #[cfg(test)]
 // mod prop_tests;
 
 // #[cfg(test)]
 // mod regression_tests;
-
-// #[cfg(test)]
-// mod arbitration_tests;
 
 // #[cfg(test)]
 // mod benchmarks;
@@ -4233,6 +4363,12 @@ impl AtomicSwap {
 
 // #[cfg(test)]
 // mod upgrade_chaos_tests;
+
+#[cfg(test)]
+mod escrow_tests;
+
+#[cfg(test)]
+mod arbitration_tests;
 
 include!("multi_signer_tests.rs");
 
@@ -4274,6 +4410,7 @@ mod installment_tests {
             conditions: Vec::new(env),
             paid_amount: paid,
             is_installment,
+            arbitrator: None,
         }
     }
 
@@ -4570,6 +4707,7 @@ mod batch_enhancement_tests {
             conditions: Vec::new(env),
             paid_amount: 0,
             is_installment: false,
+            arbitrator: None,
         };
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
         env.storage().persistent().extend_ttl(&DataKey::Swap(id), LEDGER_BUMP, LEDGER_BUMP);
