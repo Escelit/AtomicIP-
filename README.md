@@ -51,37 +51,6 @@ This Soroban implementation makes Atomic Patent:
 ./scripts/test.sh
 ```
 
-### Setup Environment
-
-Copy the example environment file:
-
-```bash
-cp .env.example .env
-```
-
-Configure your environment variables in `.env`:
-
-```env
-# Network configuration
-STELLAR_NETWORK=testnet
-STELLAR_RPC_URL=https://soroban-testnet.stellar.org
-
-# Contract addresses (after deployment)
-CONTRACT_IP_REGISTRY=<your-contract-id>
-CONTRACT_ATOMIC_SWAP=<your-contract-id>
-
-# Frontend configuration
-VITE_STELLAR_NETWORK=testnet
-VITE_STELLAR_RPC_URL=https://soroban-testnet.stellar.org
-```
-
-Network configurations are defined in `environments.toml`:
-
-- `testnet` — Stellar testnet
-- `mainnet` — Stellar mainnet
-- `futurenet` — Stellar futurenet
-- `standalone` — Local development
-
 ### Deploy to Testnet
 
 ```bash
@@ -91,10 +60,6 @@ stellar keys generate deployer --network testnet
 # Deploy
 ./scripts/deploy_testnet.sh
 ```
-
-### Run Demo
-
-Follow the step-by-step guide in `demo/demo-script.md`
 
 ## 🌐 Testnet Deployment Status
 
@@ -111,36 +76,13 @@ Latest testnet deployment addresses are published in GitHub Actions deployment s
 - [Threat Model & Security](docs/threat-model.md)
 - [Integration Guide for Wallet Providers](docs/integration-guide.md)
 
-### API Enhancements (v1.1)
-- [API Enhancements Summary](docs/api-enhancements-summary.md) — Overview of all new features
-- [GraphQL Subscriptions](docs/graphql-subscriptions.md) — Real-time event streaming (#529)
-- [API Caching Layer](docs/api-caching.md) — Performance optimization (#530)
-- [API Request Deduplication](docs/api-request-deduplication.md) — Idempotency support (#531)
-- [API Batch Requests](docs/api-batch-requests.md) — Reduce round trips (#532)
-
-### Operations & Reliability
-- [Contract Upgrade Testing](docs/contract-upgrade-testing.md) — Upgrade compatibility & authorization tests (#557)
-- [Disaster Recovery Testing](docs/disaster-recovery-testing.md) — Automated backup→restore drill (#558)
-- [Backup Integrity Verification](docs/backup-integrity-verification.md) — Checksum & structural verification (#559)
-- [Canary Deployment Testing](docs/canary-deployment.md) — Health-gated rollout with auto-rollback (#560)
-- [Disaster Recovery Plan](docs/disaster-recovery-plan.md)
-- [Backup & Recovery Guide](docs/backup-recovery-guide.md)
-
 ### Additional Resources
 - [API Reference](docs/api-reference.md)
-- [Changelog Format](docs/changelog-format.md)
 - [Security Policy](SECURITY.md)
-- [Security Scanning (CI/CD)](docs/security-scanning.md)
-- [Dependency Vulnerability Scanning](docs/dependency-scanning.md)
-- [Code Coverage Enforcement](docs/code-coverage.md)
-- [Mutation Testing](docs/mutation-testing.md)
-- [Roadmap](docs/roadmap.md)
 
 ## 📦 Release Notes and Changelog
 
-- Release notes are generated automatically from commit messages and PR metadata.
-- Push a tag in the format `v*` (for example, `v1.2.0`) to trigger the release workflow.
-- The release workflow uses `git-cliff` with configuration in `cliff.toml`.
+Release notes are generated automatically from commit messages and PR metadata. Push a tag in the format `v*` (e.g., `v1.2.0`) to trigger the release workflow.
 
 ## 🎓 Smart Contract API
 
@@ -226,8 +168,6 @@ Target Users:
 - v3.0: Frontend UI with wallet integration
 - v4.0: Mobile app, legal document generation
 
-See [docs/roadmap.md](docs/roadmap.md) for details.
-
 ## 🤝 Contributing
 
 We welcome contributions! Please:
@@ -237,22 +177,6 @@ We welcome contributions! Please:
 3. Commit your changes (`git commit -m 'Add amazing feature'`)
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
-
-See our [Code of Conduct](CODE_OF_CONDUCT.md) and [Contributing Guidelines](CONTRIBUTING.md).
-
-## 🌊 Drips Wave Contributors
-
-This project participates in Drips Wave — a contributor funding program! Check out:
-
-- [Wave Contributor Guide](docs/wave-guide.md) — How to earn funding for contributions
-- [Wave-Ready Issues](https://github.com/issues?q=label%3Awave-ready) — Funded issues ready to tackle
-- GitHub Issues labeled with `wave-ready` — Earn 100–200 points per issue
-
-Issues are categorized as:
-
-- `trivial` (100 points) — Documentation, simple tests, minor fixes
-- `medium` (150 points) — Helper functions, validation logic, moderate features
-- `high` (200 points) — Core features, complex integrations, security enhancements
 
 ## 📄 License
 
