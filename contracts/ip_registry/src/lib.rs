@@ -368,6 +368,15 @@ pub struct VerifyResult {
     pub valid: bool,
 }
 
+/// Stored result of a completed batch verification, keyed by the aggregate proof hash.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchVerifyResultStorage {
+    pub aggregate_proof: BytesN<32>,
+    pub total_count: u32,
+    pub valid_count: u32,
+}
+
 // ── Issue #459: Hierarchical Storage ─────────────────────────────────────────
 
 /// A node in the hierarchical commitment tree.
@@ -378,6 +387,41 @@ pub struct HierarchyNode {
     pub owner: Address,
     pub category_hash: BytesN<32>, // sha256 of the category label
     pub ip_ids: soroban_sdk::Vec<u64>,
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Constant-time comparison of two 32-byte arrays.
+/// Returns `true` if all 32 bytes match, `false` otherwise.
+/// Every code path performs exactly 32 XOR+OR operations regardless of input,
+/// preventing timing side-channel attacks.
+fn constant_time_bytes_32_eq(a: &BytesN<32>, b: &BytesN<32>) -> bool {
+    let a_arr = a.to_array();
+    let b_arr = b.to_array();
+    let mut diff: u8 = 0;
+    for i in 0..32 {
+        diff |= a_arr[i] ^ b_arr[i];
+    }
+    diff == 0
+}
+
+/// Deterministically aggregate multiple commitment hashes into a single proof
+/// using incremental SHA-256 hashing.
+///
+/// Starting from an all-zeros seed, each verified commitment hash is folded in:
+/// `proof ← sha256(proof || commitment_hash)`
+///
+/// This produces a deterministic, order-dependent aggregate proof that can be
+/// used to efficiently validate the entire batch.
+fn aggregate_batch_proof(env: &Env, commitment_hashes: &Vec<BytesN<32>>) -> BytesN<32> {
+    let mut proof = BytesN::from_array(env, &[0u8; 32]);
+    for hash in commitment_hashes.iter() {
+        let mut input = Bytes::new(env);
+        input.append(&proof.into());
+        input.append(&hash.into());
+        proof = env.crypto().sha256(&input).into();
+    }
+    proof
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -1420,7 +1464,8 @@ impl IpRegistry {
         preimage.append(&blinding_factor.into());
         let computed_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
 
-        record.commitment_hash == computed_hash
+        // Constant-time comparison to prevent timing side-channel attacks
+        constant_time_bytes_32_eq(&record.commitment_hash, &computed_hash)
     }
 
     /// List all IP IDs owned by an address.
@@ -3081,38 +3126,6 @@ impl IpRegistry {
             .unwrap_or(Vec::new(&env))
     }
 
-    // ── Issue #432: Batch Commitment Verification ──────────────────────────────
-
-    /// Verify multiple IP commitments in a single call to reduce gas costs.
-    ///
-    /// Each entry is a tuple of (ip_id, secret, blinding_factor). Returns a
-    /// Vec<bool> in the same order — `true` if the commitment matches, `false` otherwise.
-    /// Non-existent IPs return `false` rather than panicking.
-    pub fn batch_verify_commitments(
-        env: Env,
-        verifications: Vec<(u64, BytesN<32>, BytesN<32>)>,
-    ) -> Vec<bool> {
-        let mut results = Vec::new(&env);
-        for entry in verifications.iter() {
-            let (ip_id, secret, blinding_factor) = entry;
-            let result = if let Some(record) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, IpRecord>(&DataKey::IpRecord(ip_id))
-            {
-                let mut preimage = Bytes::new(&env);
-                preimage.append(&secret.into());
-                preimage.append(&blinding_factor.into());
-                let computed: BytesN<32> = env.crypto().sha256(&preimage).into();
-                record.commitment_hash == computed
-            } else {
-                false
-            };
-            results.push_back(result);
-        }
-        results
-    }
-
     // ── Dispute Resolution ────────────────────────────────────────────────────
 
     /// Initiate a dispute against an IP. The challenger must authorize.
@@ -3889,9 +3902,12 @@ impl IpRegistry {
     /// Verify multiple IP commitments in a single call.
     ///
     /// For each request, recomputes `sha256(secret || blinding_factor)` and
-    /// checks it against the stored commitment hash — the same ZK-style proof
-    /// used by `verify_commitment`. Returns one `VerifyResult` per request in
-    /// the same order as the input.
+    /// checks it against the stored commitment hash using constant-time comparison.
+    /// Valid commitment hashes are folded into a deterministic aggregate proof
+    /// via incremental SHA-256 hashing.
+    ///
+    /// An event is emitted with the aggregate proof hash and summary counts,
+    /// enabling off-chain listeners to track batch verification completion.
     ///
     /// # Arguments
     ///
@@ -3905,18 +3921,53 @@ impl IpRegistry {
     ///
     /// Panics with `IpNotFound` if any `ip_id` does not exist.
     pub fn batch_verify_commitments(env: Env, requests: Vec<VerifyRequest>) -> Vec<VerifyResult> {
+        let total_count = requests.len() as u32;
         let mut results = Vec::new(&env);
+        let mut valid_hashes: Vec<BytesN<32>> = Vec::new(&env);
+
         for req in requests.iter() {
             let record = require_ip_exists(&env, req.ip_id);
+
             let mut preimage = Bytes::new(&env);
             preimage.append(&req.secret.into());
             preimage.append(&req.blinding_factor.into());
             let computed: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+            let valid = constant_time_bytes_32_eq(&record.commitment_hash, &computed);
             results.push_back(VerifyResult {
                 ip_id: req.ip_id,
-                valid: record.commitment_hash == computed,
+                valid,
             });
+
+            if valid {
+                valid_hashes.push_back(record.commitment_hash);
+            }
         }
+
+        let valid_count = valid_hashes.len() as u32;
+        let aggregate_proof = aggregate_batch_proof(&env, &valid_hashes);
+
+        let stored = BatchVerifyResultStorage {
+            aggregate_proof: aggregate_proof.clone(),
+            total_count,
+            valid_count,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::BatchVerifyResult(aggregate_proof.clone()), &stored);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::BatchVerifyResult(aggregate_proof.clone()),
+                LEDGER_BUMP,
+                LEDGER_BUMP,
+            );
+
+        env.events().publish(
+            (symbol_short!("b_vfy"),),
+            (aggregate_proof, total_count, valid_count),
+        );
+
         results
     }
 
@@ -4203,7 +4254,8 @@ impl IpRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env, IntoVal};
+    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::{Env, IntoVal};
 
     /// Bug Condition Exploration Test — Property 1
     ///
@@ -4846,6 +4898,78 @@ mod tests {
             blinding_factor: BytesN::from_array(&env, &[0x02u8; 32]),
         });
         client.batch_verify_commitments(&requests);
+    }
+
+    #[test]
+    fn test_batch_verify_empty_batch() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let requests = soroban_sdk::Vec::new(&env);
+        let results = client.batch_verify_commitments(&requests);
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_batch_verify_single_item() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let secret = BytesN::from_array(&env, &[0x42u8; 32]);
+        let blind = BytesN::from_array(&env, &[0x24u8; 32]);
+        let mut pre = soroban_sdk::Bytes::new(&env);
+        pre.append(&secret.clone().into());
+        pre.append(&blind.clone().into());
+        let hash: BytesN<32> = env.crypto().sha256(&pre).into();
+        let id = client.commit_ip(&owner, &hash, &0u32);
+
+        let mut requests = soroban_sdk::Vec::new(&env);
+        requests.push_back(VerifyRequest { ip_id: id, secret, blinding_factor: blind });
+
+        let results = client.batch_verify_commitments(&requests);
+        assert_eq!(results.len(), 1);
+        assert!(results.get(0).unwrap().valid);
+    }
+
+    #[test]
+    fn test_batch_verify_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let secret = BytesN::from_array(&env, &[0xA1u8; 32]);
+        let blind = BytesN::from_array(&env, &[0xB2u8; 32]);
+        let mut pre = soroban_sdk::Bytes::new(&env);
+        pre.append(&secret.clone().into());
+        pre.append(&blind.clone().into());
+        let hash: BytesN<32> = env.crypto().sha256(&pre).into();
+        let id = client.commit_ip(&owner, &hash, &0u32);
+
+        let mut requests = soroban_sdk::Vec::new(&env);
+        requests.push_back(VerifyRequest { ip_id: id, secret, blinding_factor: blind });
+
+        let _results = client.batch_verify_commitments(&requests);
+
+        let events = env.events().all();
+        let b_vfy_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.0 == (symbol_short!("b_vfy"),))
+            .collect();
+        assert_eq!(b_vfy_events.len(), 1);
+        // Verify event data: (aggregate_proof, total_count=1, valid_count=1)
+        let (_topics, data) = &b_vfy_events.get(0).unwrap();
+        let (proof, total, valid): (BytesN<32>, u32, u32) =
+            soroban_sdk::IntoVal::into_val(data, &env);
+        assert_eq!(total, 1);
+        assert_eq!(valid, 1);
+        assert_ne!(proof, BytesN::from_array(&env, &[0u8; 32]));
     }
 
     // ── Issue #459: Hierarchical Storage Tests ────────────────────────────────
