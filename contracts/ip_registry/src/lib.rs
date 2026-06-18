@@ -173,6 +173,8 @@ pub enum DataKey {
     BatchMetadata(u64),
     // Issue #457: Encrypted commitment
     EncryptedCommitment(u64),
+    // Issue #456: Compression algorithm selection
+    CompressionSelection(u64),
     // Issue #465: Batch escrow — keyed by escrow_id (sha256 of ip_ids + timestamp)
     BatchEscrow(BytesN<32>),
 }
@@ -4172,7 +4174,7 @@ impl IpRegistry {
 
     // ── Issue #458: Batch Verification with ZK Proofs ─────────────────────────
 
-    /// Verify multiple IP commitments in a single call.
+    /// Verify multiple IP commitments in a single call with ZK-proof support.
     ///
     /// For each request, recomputes `sha256(secret || blinding_factor)` and
     /// checks it against the stored commitment hash using constant-time comparison.
@@ -4184,11 +4186,15 @@ impl IpRegistry {
     ///
     /// # Arguments
     ///
-    /// * `requests` - Vec of `VerifyRequest` (ip_id, secret, blinding_factor)
+    /// * `requests` — Vec of `VerifyRequest` (ip_id, secret, blinding_factor)
     ///
     /// # Returns
     ///
     /// `Vec<VerifyResult>` — one entry per request with `valid: true/false`.
+    ///
+    /// # Events
+    ///
+    /// Emits a `batch_vfy` event with `(aggregated_hash, count, all_valid)`.
     ///
     /// # Panics
     ///
@@ -4241,6 +4247,50 @@ impl IpRegistry {
         );
 
         results
+    }
+
+    /// Deterministic hash aggregation for batch proof.
+    ///
+    /// Combines all (ip_id, on-chain commitment_hash, valid) tuples with a
+    /// domain separator into a single SHA-256 hash. The result is used as the
+    /// on-chain proof ID and can be recomputed by anyone with access to the
+    /// same inputs (minus the secrets).
+    fn compute_aggregated_proof(
+        env: &Env,
+        _ip_ids: &Vec<u64>,
+        stored_hashes: &Vec<BytesN<32>>,
+        results: &Vec<VerifyResult>,
+    ) -> BytesN<32> {
+        let mut buf = Bytes::new(env);
+        // Domain separator: "IP_BATCH_PROOF_V1"
+        buf.append(&Bytes::from_array(
+            env,
+            &[0x49, 0x50, 0x42, 0x50, 0x56, 0x31],
+        ));
+
+        for i in 0..results.len() {
+            let r = results.get(i).unwrap();
+            let ip_bytes = r.ip_id.to_be_bytes();
+            buf.append(&Bytes::from_array(env, &ip_bytes));
+            buf.append(&stored_hashes.get(i).unwrap().clone().into());
+            let valid_byte: u8 = if r.valid { 1 } else { 0 };
+            buf.append(&Bytes::from_array(env, &[valid_byte]));
+        }
+
+        env.crypto().sha256(&buf).into()
+    }
+
+    /// Retrieve a stored batch verification proof by its aggregated hash.
+    ///
+    /// Returns `None` if no proof exists for the given hash (e.g. the proof
+    /// has expired or was never created).
+    pub fn verify_batch_proof(
+        env: Env,
+        proof_hash: BytesN<32>,
+    ) -> Option<BatchVerifyProof> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BatchVerifyResult(proof_hash))
     }
 
     // ── Issue #459: Hierarchical Storage ─────────────────────────────────────

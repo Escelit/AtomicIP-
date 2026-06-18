@@ -11,6 +11,7 @@ pub const LEDGER_BUMP: u32 = 6_307_200;
 
 pub const REVOKE_TOPIC: Symbol = soroban_sdk::symbol_short!("revoke");
 pub const TRANSFER_TOPIC: Symbol = soroban_sdk::symbol_short!("ip_xfer");
+pub const BATCH_VERIFY_TOPIC: Symbol = soroban_sdk::symbol_short!("batch_vfy");
 
 // ── Access Control ────────────────────────────────────────────────────────────
 
