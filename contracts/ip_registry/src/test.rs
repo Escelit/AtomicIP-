@@ -1,11 +1,12 @@
 #[cfg(test)]
 mod tests {
-    use crate::IpRecord;
+    use crate::{BatchVerifyProof, IpRecord, VerifyRequest, VerifyResult};
     use soroban_sdk::contractclient;
     use soroban_sdk::testutils::Address as TestAddress;
     use soroban_sdk::testutils::Events;
     use soroban_sdk::{symbol_short, Address, BytesN, Env, IntoVal, TryFromVal, Vec};
 
+    use crate::types::BATCH_VERIFY_TOPIC;
     use crate::types::REVOKE_TOPIC;
     use crate::types::TRANSFER_TOPIC;
 
@@ -60,8 +61,9 @@ mod tests {
         fn challenge_ip(env: Env, ip_id: u64, challenger: Address, reason: soroban_sdk::Bytes);
         fn get_ip_disputes(env: Env, ip_id: u64) -> Vec<crate::IpChallenge>;
         fn commit_ip_version(env: Env, owner: Address, commitment_hash: BytesN<32>, parent_ip_id: u64) -> u64;
-        // Issue #432
-        fn batch_verify_commitments(env: Env, verifications: Vec<(u64, BytesN<32>, BytesN<32>)>) -> Vec<bool>;
+        // Issue #458
+        fn batch_verify_commitments(env: Env, requests: Vec<VerifyRequest>) -> Vec<VerifyResult>;
+        fn verify_batch_proof(env: Env, proof_hash: BytesN<32>) -> Option<BatchVerifyProof>;
         fn batch_commit_ip_anonymous(env: Env, blinded_owner: BytesN<32>, commitment_hashes: Vec<BytesN<32>>) -> Vec<u64>;
         fn batch_stake_commitments(env: Env, ip_ids: Vec<u64>, amounts: Vec<i128>);
         fn batch_update_reputation(env: Env, ip_ids: Vec<u64>, score_deltas: Vec<i64>);
@@ -1366,14 +1368,14 @@ mod tests {
         let id1 = client.commit_ip(&owner, &hash1, &0u32);
         let id2 = client.commit_ip(&owner, &hash2, &0u32);
 
-        let mut verifications: Vec<(u64, BytesN<32>, BytesN<32>)> = Vec::new(&env);
-        verifications.push_back((id1, secret1, bf1));
-        verifications.push_back((id2, secret2, bf2));
+        let mut requests = Vec::new(&env);
+        requests.push_back(VerifyRequest { ip_id: id1, secret: secret1, blinding_factor: bf1 });
+        requests.push_back(VerifyRequest { ip_id: id2, secret: secret2, blinding_factor: bf2 });
 
-        let results = client.batch_verify_commitments(&verifications);
+        let results = client.batch_verify_commitments(&requests);
         assert_eq!(results.len(), 2);
-        assert!(results.get(0).unwrap());
-        assert!(results.get(1).unwrap());
+        assert!(results.get(0).unwrap().valid);
+        assert!(results.get(1).unwrap().valid);
     }
 
     #[test]
@@ -1393,27 +1395,29 @@ mod tests {
         let id = client.commit_ip(&owner, &hash, &0u32);
 
         let wrong_secret = BytesN::from_array(&env, &[0xFFu8; 32]);
-        let mut verifications: Vec<(u64, BytesN<32>, BytesN<32>)> = Vec::new(&env);
-        verifications.push_back((id, wrong_secret, bf));
+        let mut requests = Vec::new(&env);
+        requests.push_back(VerifyRequest { ip_id: id, secret: wrong_secret, blinding_factor: bf });
 
-        let results = client.batch_verify_commitments(&verifications);
-        assert!(!results.get(0).unwrap());
+        let results = client.batch_verify_commitments(&requests);
+        assert!(!results.get(0).unwrap().valid);
     }
 
     #[test]
-    fn test_batch_verify_nonexistent_ip_returns_false() {
+    #[should_panic]
+    fn test_batch_verify_nonexistent_ip_panics() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(crate::IpRegistry, ());
         let client = IpRegistryClient::new(&env, &contract_id);
 
-        let secret = BytesN::from_array(&env, &[0x01u8; 32]);
-        let bf = BytesN::from_array(&env, &[0x02u8; 32]);
-        let mut verifications: Vec<(u64, BytesN<32>, BytesN<32>)> = Vec::new(&env);
-        verifications.push_back((999u64, secret, bf));
+        let mut requests = Vec::new(&env);
+        requests.push_back(VerifyRequest {
+            ip_id: 9999,
+            secret: BytesN::from_array(&env, &[0x01u8; 32]),
+            blinding_factor: BytesN::from_array(&env, &[0x02u8; 32]),
+        });
 
-        let results = client.batch_verify_commitments(&verifications);
-        assert!(!results.get(0).unwrap());
+        client.batch_verify_commitments(&requests);
     }
 
     // ── Issue #433: IP Ownership Proof Challenge ───────────────────────────────

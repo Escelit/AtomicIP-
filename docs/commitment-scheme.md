@@ -341,6 +341,206 @@ AtomicIP uses a simpler SHA-256-based scheme because:
 
 The trade-off is that SHA-256 commitments are not homomorphic, but this property isn't needed for IP registration.
 
+## Batch Verification with ZK Proof Support (Issue #458)
+
+AtomicIP supports **batch verification** that aggregates multiple Pedersen commitment checks into a single provable operation. This enables verifiers to confirm the correctness of multiple IP commitments at once while generating an on-chain receipt.
+
+### Batch Verification Flow
+
+```
+                          ┌─────────────────────────────┐
+                          │     Caller submits batch     │
+                          │  Vec<VerifyRequest> with     │
+                          │  (ip_id, secret, blinding)  │
+                          └──────────────┬──────────────┘
+                                         │
+                                         ▼
+                          ┌─────────────────────────────┐
+                          │   For each request:          │
+                          │   1. Look up IpRecord         │
+                          │   2. Compute sha256(s || bf) │
+                          │   3. Constant-time compare    │
+                          │   4. Collect VerifyResult     │
+                          └──────────────┬──────────────┘
+                                         │
+                                         ▼
+                          ┌─────────────────────────────┐
+                          │  Incremental hash aggregate │
+                          │  H("IP_BATCH_PROOF_V1" ||   │
+                          │    ip_id_1 || hash_1 || v_1 │
+                          │    ip_id_2 || hash_2 || v_2 │
+                          │    ...)                     │
+                          └──────────────┬──────────────┘
+                                         │
+                                         ▼
+                          ┌─────────────────────────────┐
+                          │  Store BatchVerifyProof      │
+                          │  on-chain keyed by hash      │
+                          └──────────────┬──────────────┘
+                                         │
+                                         ▼
+                          ┌─────────────────────────────┐
+                          │  Emit batch_vfy event        │
+                          │  (aggregated_hash, count,    │
+                          │   all_valid)                 │
+                          └─────────────────────────────┘
+```
+
+### Key Properties
+
+| Property | Description |
+|---|---|
+| **Constant-time comparison** | Each commitment hash is compared using XOR-based equality that never short-circuits, preventing timing side-channel attacks |
+| **Deterministic aggregation** | Identical input sets produce identical proof hashes — the result is deterministic and reproducible |
+| **On-chain proof storage** | The aggregated `BatchVerifyProof` is stored on-chain keyed by its hash, enabling future retrieval via `verify_batch_proof()` |
+| **Event emission** | A `batch_vfy` event is emitted with the aggregated hash, item count, and overall validity flag for off-chain indexing |
+
+### How It Works
+
+1. **Preparation**: Each request contains an `ip_id`, the `secret`, and the `blinding_factor` used when the commitment was created.
+
+2. **Individual Verification**: For each request, the contract:
+   - Loads the `IpRecord` for the given `ip_id`
+   - Computes `sha256(secret || blinding_factor)`
+   - Compares the result against the stored commitment hash using **constant-time comparison** (`constant_time_eq_32`)
+   - Appends a `VerifyResult { ip_id, valid }` to the output vector
+
+3. **Hash Aggregation**: After all individual checks, an **aggregated proof hash** is computed:
+   ```
+   aggregated_hash = sha256(
+     domain_separator("IP_BATCH_PROOF_V1") ||
+     ip_id_1 || stored_commitment_hash_1 || valid_1 ||
+     ip_id_2 || stored_commitment_hash_2 || valid_2 ||
+     ...
+   )
+   ```
+   This incremental hashing ensures the proof is bound to:
+   - The specific IP IDs being verified
+   - The on-chain commitment hashes at verification time
+   - The validity outcomes
+
+4. **Storage**: The `BatchVerifyProof` struct is stored with key `DataKey::BatchVerifyResult(aggregated_hash)`:
+   ```rust
+   pub struct BatchVerifyProof {
+       pub ip_ids: Vec<u64>,          // The IP IDs verified
+       pub aggregated_hash: BytesN<32>, // The proof hash
+       pub timestamp: u64,             // Ledger timestamp
+       pub all_valid: bool,            // True if every check passed
+   }
+   ```
+
+5. **Event Emission**: A `batch_vfy` event is emitted with topics `(batch_vfy,)` and data `(aggregated_hash, count, all_valid)`.
+
+### Contract API
+
+```rust
+/// Verify multiple IP commitments with ZK-proof support.
+/// Returns one VerifyResult per request.
+fn batch_verify_commitments(
+    env: Env,
+    requests: Vec<VerifyRequest>,
+) -> Vec<VerifyResult>
+
+/// Retrieve a stored batch verification proof by its aggregated hash.
+fn verify_batch_proof(
+    env: Env,
+    proof_hash: BytesN<32>,
+) -> Option<BatchVerifyProof>
+```
+
+### `VerifyRequest`
+
+| Field | Type | Description |
+|---|---|---|
+| `ip_id` | `u64` | The IP ID to verify |
+| `secret` | `BytesN<32>` | The secret used when committing |
+| `blinding_factor` | `BytesN<32>` | The blinding factor used when committing |
+
+### `VerifyResult`
+
+| Field | Type | Description |
+|---|---|---|
+| `ip_id` | `u64` | The IP ID that was verified |
+| `valid` | `bool` | `true` if the proof is correct |
+
+### `BatchVerifyProof`
+
+| Field | Type | Description |
+|---|---|---|
+| `ip_ids` | `Vec<u64>` | The IP IDs included in this batch |
+| `aggregated_hash` | `BytesN<32>` | The aggregated proof hash |
+| `timestamp` | `u64` | Ledger timestamp when verification ran |
+| `all_valid` | `bool` | `true` if every commitment was valid |
+
+### Security: Constant-Time Comparison
+
+The `batch_verify_commitments` function uses `constant_time_eq_32` instead of `==` for hash comparison:
+
+```rust
+fn constant_time_eq_32(a: &BytesN<32>, b: &BytesN<32>) -> bool {
+    let a_arr = a.to_array();
+    let b_arr = b.to_array();
+    let mut diff: u8 = 0;
+    for i in 0..32 {
+        diff |= a_arr[i] ^ b_arr[i];
+    }
+    diff == 0
+}
+```
+
+This XORs every byte pair and ORs the results together. Unlike `==`, this implementation:
+- **Never short-circuits** on the first mismatch
+- **Always touches all 32 bytes** regardless of the result
+- **Prevents timing side-channel attacks** that could leak information about the secret
+
+### Example Flow
+
+```rust
+use soroban_sdk::{BytesN, Env, Vec};
+
+fn batch_verify_example(env: &Env, client: &IpRegistryClient) {
+    let requests = vec![
+        VerifyRequest { ip_id: 1, secret: s1, blinding_factor: b1 },
+        VerifyRequest { ip_id: 2, secret: s2, blinding_factor: b2 },
+    ];
+
+    // Batch verify all commitments
+    let results: Vec<VerifyResult> = client.batch_verify_commitments(&requests);
+
+    // Check individual results
+    assert!(results.get(0).unwrap().valid);
+    assert!(results.get(1).unwrap().valid);
+
+    // The aggregated proof is stored on-chain.
+    // Retrieve it later by its hash:
+    // let proof = client.verify_batch_proof(&aggregated_hash);
+}
+```
+
+### Event: `batch_vfy`
+
+Emitted once per `batch_verify_commitments` call:
+
+| Topic | Data |
+|---|---|
+| `(batch_vfy,)` | `(aggregated_hash: BytesN<32>, count: u64, all_valid: bool)` |
+
+### Off-Chain Indexing
+
+The `batch_vfy` event enables off-chain services to:
+- Track batch verification completion without replaying individual checks
+- Monitor overall validity of verified batches
+- Build verification histories for reputation systems
+
+### Error Cases
+
+| Condition | Behavior |
+|---|---|
+| Empty request vector | Returns empty `Vec<VerifyResult>` — no proof is stored, no event emitted |
+| Nonexistent `ip_id` | Panics with `IpNotFound` |
+| Mismatched secret/blinding | Individual `VerifyResult.valid` is `false`; `all_valid` is `false` |
+| All valid | All results have `valid == true`; `all_valid == true` |
+
 ## References
 
 - [SHA-256 Wikipedia](https://en.wikipedia.org/wiki/SHA-2)
