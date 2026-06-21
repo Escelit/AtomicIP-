@@ -200,6 +200,7 @@ fn build_app() -> Router {
     let schema = graphql::build_schema();
     let health_checker = Arc::new(health::HealthChecker::new());
     let circuit_breaker = Arc::new(circuit_breaker::CircuitBreaker::new(
+        "default",
         circuit_breaker::CircuitBreakerConfig::default(),
     ));
     

@@ -46,6 +46,7 @@ pub mod graphql;
 pub mod request_signing;
 pub mod invariants;
 pub mod health;
+pub mod circuit_breaker;
 pub mod compression;
 pub mod load_balancer;
 pub mod middleware_pipeline;
