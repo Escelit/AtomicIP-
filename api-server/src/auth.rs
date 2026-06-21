@@ -1,5 +1,5 @@
+use async_trait::async_trait;
 use axum::{
-    async_trait,
     extract::{FromRequestParts, Request},
     http::{request::Parts, header::AUTHORIZATION, StatusCode},
     middleware::Next,
@@ -106,7 +106,8 @@ pub fn verify_stellar_signature(
         _ => return Err(AuthError::InvalidPublicKey),
     };
 
-    let verifying_key = VerifyingKey::from_slice(&pk_raw)
+    let pk_array: [u8; 32] = pk_raw.try_into().map_err(|_| AuthError::InvalidPublicKey)?;
+    let verifying_key = VerifyingKey::from_bytes(&pk_array)
         .map_err(|_| AuthError::InvalidPublicKey)?;
 
     let signature_bytes = hex::decode(signature_hex)
@@ -174,7 +175,6 @@ impl IntoResponse for AuthError {
 }
 
 /// Extractor for authenticated claims from request extensions.
-#[async_trait]
 impl<S> FromRequestParts<S> for AuthExtension
 where
     S: Send + Sync,

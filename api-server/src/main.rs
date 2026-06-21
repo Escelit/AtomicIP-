@@ -3,11 +3,25 @@ use axum::body::Body;
 use axum::http::{StatusCode, HeaderMap};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::extract::Request;
+use axum::extract::{FromRef, Request};
 use utoipa::OpenApi;
-use utoipa_swagger_ui::SwaggerUi;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use std::sync::Arc;
+
+/// Shared application state injected into every handler.
+#[derive(Clone)]
+struct AppState {
+    schema:           graphql::AtomicIpSchema,
+    ws_broadcaster:   Arc<websocket::EventBroadcaster>,
+    sse_broadcaster:  Arc<events::EventBroadcaster>,
+    health_checker:   Arc<health::HealthChecker>,
+}
+
+impl FromRef<AppState> for Arc<health::HealthChecker> {
+    fn from_ref(state: &AppState) -> Self {
+        state.health_checker.clone()
+    }
+}
 
 mod auth;
 mod batch;
@@ -18,6 +32,7 @@ mod events;
 mod graphql;
 mod handlers;
 mod metrics;
+mod middleware_pipeline;
 mod schemas;
 mod tracing_middleware;
 mod versioning;
@@ -82,12 +97,7 @@ mod request_queue;
         schemas::BulkCommitIpResponse,
         schemas::BulkInitiateSwapRequest,
         schemas::BulkInitiateSwapResponse,
-        schemas::BulkOperationResult,
-        batch::BatchRequest,
-        batch::BatchResponse,
-        batch::SingleRequest,
-        batch::SingleResponse,
-        events::ContractEvent,
+        schemas::BulkOperationResult<schemas::IpRecord>,
     )),
     tags(
         (name = "IP Registry", description = "Commit and query intellectual property records"),
@@ -99,17 +109,17 @@ mod request_queue;
 )]
 pub struct ApiDoc;
 
-/// GraphQL endpoint — accepts POST requests with a GraphQL query body.
+/// Serve the OpenAPI 3.x spec as JSON.
+async fn openapi_handler() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::to_value(ApiDoc::openapi()).unwrap_or_default())
+}
+
+/// GraphQL query/mutation endpoint (HTTP POST).
 async fn graphql_handler(
-    axum::extract::State((schema, _, _, _)): axum::extract::State<(
-        graphql::AtomicIpSchema,
-        Arc<websocket::EventBroadcaster>,
-        Arc<events::EventBroadcaster>,
-        deduplication::DeduplicationStore,
-    )>,
+    axum::extract::State(state): axum::extract::State<AppState>,
     req: GraphQLRequest,
 ) -> GraphQLResponse {
-    schema.execute(req.into_inner()).await.into()
+    state.schema.execute(req.into_inner()).await.into()
 }
 
 /// Middleware: reject POST/PUT/PATCH requests whose body is non-empty but lacks
@@ -138,79 +148,114 @@ async fn main() {
         Arc::new(graphql::MockSorobanRpcClient::default()),
         subscription_broadcaster.clone(),
     );
-    let broadcaster = Arc::new(websocket::EventBroadcaster::new());
-    let health_checker = Arc::new(health::HealthChecker::new());
+
+    let state = AppState {
+        schema,
+        ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
+        sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
+        health_checker:  Arc::new(health::HealthChecker::new()),
+    };
 
     let app = Router::new()
-        .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
-        .route("/health", get(health::health_handler))
+        .route("/health",          get(health::health_handler))
         .route("/health/detailed", get(health::detailed_health_handler))
-        .route("/metrics", get(metrics::metrics_handler))
-        .route("/graphql", post(graphql_handler))
-        .route("/ws", get(ws_handler))
-        .route("/events", get(events::events_handler))
-        .route("/batch", post(batch::batch_handler))
-        .route("/ip/commit", post(handlers::commit_ip))
-        .route("/ip/{ip_id}", get(handlers::get_ip))
-        .route("/ip/transfer", post(handlers::transfer_ip))
-        .route("/ip/verify", post(handlers::verify_commitment))
-        .route("/ip/owner/{owner}", get(handlers::list_ip_by_owner))
-        .route("/swap/initiate", post(handlers::initiate_swap))
-        .route("/swap/batch-initiate", post(handlers::batch_initiate_swap))
-        .route("/swap/{swap_id}/accept", post(handlers::accept_swap))
-        .route("/swap/{swap_id}/reveal", post(handlers::reveal_key))
-        .route("/swap/{swap_id}/cancel", post(handlers::cancel_swap))
-        .route("/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
-        .route("/swap/{swap_id}", get(handlers::get_swap))
-        .with_state((schema, broadcaster.clone(), health_checker.clone()))
+        .route("/metrics",         get(metrics::metrics_handler))
+        .route("/graphql",         post(graphql_handler))
+        .route("/graphql/ws",      get(graphql_ws_handler))
+        .route("/ws",              get(ws_handler))
+        .route("/events",          get(events_handler))
+        .route("/batch",           post(batch::batch_handler))
+        .route("/ip/commit",                      post(handlers::commit_ip))
+        .route("/ip/{ip_id}",                     get(handlers::get_ip))
+        .route("/ip/transfer",                    post(handlers::transfer_ip))
+        .route("/ip/verify",                      post(handlers::verify_commitment))
+        .route("/ip/owner/{owner}",               get(handlers::list_ip_by_owner))
+        .route("/swap/initiate",                  post(handlers::initiate_swap))
+        .route("/swap/batch-initiate",            post(handlers::batch_initiate_swap))
+        .route("/swap/{swap_id}/accept",          post(handlers::accept_swap))
+        .route("/swap/{swap_id}/reveal",          post(handlers::reveal_key))
+        .route("/swap/{swap_id}/cancel",          post(handlers::cancel_swap))
+        .route("/swap/{swap_id}/cancel-expired",  post(handlers::cancel_expired_swap))
+        .route("/swap/{swap_id}",                 get(handlers::get_swap))
+        .route("/openapi.json", get(openapi_handler))
+        .with_state(state)
         .layer(middleware::from_fn(metrics::track))
         .layer(middleware::from_fn(middleware_pipeline::cors_middleware));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
-    println!("Swagger UI   -> http://localhost:8080/docs");
-    println!("OpenAPI JSON -> http://localhost:8080/openapi.json");
-    println!("Health Check -> http://localhost:8080/health");
-    println!("Metrics      -> http://localhost:8080/metrics");
-    println!("WebSocket    -> ws://localhost:8080/ws");
-    println!("Events SSE   -> http://localhost:8080/events");
-    println!("Batch API    -> http://localhost:8080/batch");
-    println!("GraphQL      -> http://localhost:8080/graphql");
+    println!("OpenAPI JSON    -> http://localhost:8080/openapi.json");
+    println!("Health Check    -> http://localhost:8080/health");
+    println!("Metrics         -> http://localhost:8080/metrics");
+    println!("WebSocket (raw) -> ws://localhost:8080/ws");
+    println!("GraphQL WS      -> ws://localhost:8080/graphql/ws");
+    println!("Events SSE      -> http://localhost:8080/events");
+    println!("Batch API       -> http://localhost:8080/batch");
+    println!("GraphQL         -> http://localhost:8080/graphql");
     axum::serve(listener, app).await.unwrap();
 }
 
+/// GraphQL subscription endpoint over `graphql-transport-ws` WebSocket protocol.
+async fn graphql_ws_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    protocol: async_graphql_axum::GraphQLProtocol,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> impl axum::response::IntoResponse {
+    let schema = state.schema.clone();
+    ws.protocols(["graphql-transport-ws", "graphql-ws"])
+        .on_upgrade(move |stream| {
+            async_graphql_axum::GraphQLWebSocket::new(stream, schema, protocol).serve()
+        })
+}
+
+/// Raw WebSocket endpoint (legacy, non-GraphQL JSON protocol).
 async fn ws_handler(
     ws: axum::extract::ws::WebSocketUpgrade,
-    axum::extract::State((_, broadcaster, _)): axum::extract::State<(graphql::AtomicIpSchema, Arc<websocket::EventBroadcaster>, Arc<health::HealthChecker>)>,
+    axum::extract::State(state): axum::extract::State<AppState>,
 ) -> impl axum::response::IntoResponse {
+    let broadcaster = state.ws_broadcaster.clone();
     ws.on_upgrade(|socket| websocket::handle_socket(socket, broadcaster))
 }
 
+/// SSE endpoint — adapts the AppState to the handler's expected extractor.
+async fn events_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> impl axum::response::IntoResponse {
+    let sender = (*state.sse_broadcaster).clone();
+    events::events_handler(axum::extract::State(Arc::new(sender))).await
+}
+
 fn build_app() -> Router {
-    let schema = graphql::build_schema();
-    let health_checker = Arc::new(health::HealthChecker::new());
-    let circuit_breaker = Arc::new(circuit_breaker::CircuitBreaker::new(
-        circuit_breaker::CircuitBreakerConfig::default(),
-    ));
-    
+    let broadcaster = Arc::new(graphql::SubscriptionBroadcaster::new());
+    let schema = graphql::build_schema_with_broadcaster(
+        Arc::new(graphql::MockSorobanRpcClient::default()),
+        broadcaster,
+    );
+    let state = AppState {
+        schema,
+        ws_broadcaster:  Arc::new(websocket::EventBroadcaster::new()),
+        sse_broadcaster: Arc::new(events::create_event_broadcaster().0),
+        health_checker:  Arc::new(health::HealthChecker::new()),
+    };
+
     Router::new()
         .route("/health", get(health::health_handler))
         .route("/version", get(versioning::get_version_info))
         .route("/v1/graphql", post(graphql_handler))
         .route("/v1/ip/commit", post(handlers::commit_ip))
-        .route("/v1/ip/:ip_id", get(handlers::get_ip))
+        .route("/v1/ip/{ip_id}", get(handlers::get_ip))
         .route("/v1/ip/transfer", post(handlers::transfer_ip))
         .route("/v1/ip/verify", post(handlers::verify_commitment))
-        .route("/v1/ip/owner/:owner", get(handlers::list_ip_by_owner))
+        .route("/v1/ip/owner/{owner}", get(handlers::list_ip_by_owner))
         .route("/v1/swap/initiate", post(handlers::initiate_swap))
         .route("/v1/swap/bulk/initiate", post(handlers::batch_initiate_swap))
-        .route("/v1/swap/:swap_id/accept", post(handlers::accept_swap))
-        .route("/v1/swap/:swap_id/reveal", post(handlers::reveal_key))
-        .route("/v1/swap/:swap_id/cancel", post(handlers::cancel_swap))
-        .route("/v1/swap/:swap_id/cancel-expired", post(handlers::cancel_expired_swap))
-        .route("/v1/swap/:swap_id", get(handlers::get_swap))
+        .route("/v1/swap/{swap_id}/accept", post(handlers::accept_swap))
+        .route("/v1/swap/{swap_id}/reveal", post(handlers::reveal_key))
+        .route("/v1/swap/{swap_id}/cancel", post(handlers::cancel_swap))
+        .route("/v1/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
+        .route("/v1/swap/{swap_id}", get(handlers::get_swap))
         .route("/v1/bulk/commit-ip", post(handlers::bulk_commit_ip))
         .route("/v1/bulk/initiate-swap", post(handlers::bulk_initiate_swap))
-        .with_state((schema, health_checker))
+        .with_state(state)
         .layer(middleware::from_fn(tracing_middleware::trace_requests))
         .layer(middleware::from_fn(versioning::version_negotiation))
         .layer(middleware::from_fn(compression::compression_middleware))
@@ -296,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn test_openapi_json_endpoint_returns_valid_spec() {
         let app = Router::new()
-            .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
+            .route("/openapi.json", get(openapi_handler))
             .layer(middleware::from_fn(require_json_content_type));
         let resp = app
             .oneshot(
@@ -821,3 +866,4 @@ mod tests {
             .unwrap();
         assert_eq!(resp.headers().get("Content-Encoding").unwrap(), "gzip");
     }
+}

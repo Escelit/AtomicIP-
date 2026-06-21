@@ -151,7 +151,7 @@ impl Clone for CircuitBreaker {
             success_count: Arc::clone(&self.success_count),
             last_failure_time: Arc::clone(&self.last_failure_time),
             half_open_calls: Arc::clone(&self.half_open_calls),
-            config: self.config,
+            config: self.config.clone(),
         }
     }
 }

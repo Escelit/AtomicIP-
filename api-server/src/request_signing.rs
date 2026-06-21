@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn test_valid_stellar_public_key() {
-        let valid_key = "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3XVQCRWGSGA";
+        let valid_key = "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3XVQCRWGSGAX";
         assert!(is_valid_stellar_public_key(valid_key));
     }
 

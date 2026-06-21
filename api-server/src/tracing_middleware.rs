@@ -1,4 +1,5 @@
 use axum::http::{Request, HeaderMap};
+use axum::body::Body;
 use axum::middleware::Next;
 use axum::response::Response;
 use uuid::Uuid;
@@ -12,7 +13,7 @@ pub const REQUEST_ID_HEADER: &str = "X-Request-ID";
 
 /// Middleware to add request tracing with trace IDs
 pub async fn trace_requests(
-    mut req: Request,
+    mut req: Request<Body>,
     next: Next,
 ) -> Response {
     let trace_id = extract_or_generate_trace_id(req.headers());

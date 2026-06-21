@@ -141,7 +141,7 @@ pub async fn list_ip_by_owner(
     let offset = pagination.offset;
 
     // #316: Check cache
-    let cache_key = cache::ip_list_key(&owner, limit, offset);
+    let cache_key = cache::ip_list_key(&owner, limit, &offset.to_string());
     if let Some(cached) = cache::get::<ListIpByOwnerResponse>(&cache_key) {
         return (
             StatusCode::OK,
@@ -226,14 +226,14 @@ pub async fn list_ip_by_owner_cursor(
         .collect();
 
     // Calculate next cursor
-    let next_cursor = if page.len() == limit as usize && (offset + limit as usize) < total_count as usize {
+    let next_cursor = if page.len() == limit as usize && (offset as u64 + limit) < total_count {
         let last_item_id = page.last().copied().unwrap_or(0);
-        Some(crate::schemas::cursor::new(last_item_id, offset + limit))
+        Some(crate::schemas::cursor::new(last_item_id, offset as u64 + limit))
     } else {
         None
     };
 
-    let has_more = offset + limit < total_count;
+    let has_more = offset as u64 + limit < total_count;
 
     let resp = PaginatedResponse {
         items: page,
@@ -320,7 +320,8 @@ pub async fn batch_initiate_swap(Json(body): Json<BatchInitiateSwapRequest>) -> 
     // #523: Return cached result if the caller supplied a matching idempotency key.
     if let Some(ref key) = body.idempotency_key {
         if let Some(entry) = BATCH_SWAP_IDEMPOTENCY.get(key.as_str()) {
-            let (ref cached, ref ts) = *entry;
+            let cached: &serde_json::Value = &entry.0;
+            let ts: &tokio::time::Instant = &entry.1;
             if ts.elapsed() < Duration::from_secs(3600) {
                 if let Ok(response) = serde_json::from_value::<BatchInitiateSwapResponse>(cached.clone()) {
                     return Ok(Json(response));

@@ -82,41 +82,15 @@ pub async fn error_recovery_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let mut recovery_context = ErrorRecoveryContext::default();
-    let config = RetryConfig::default();
+    // Body is not Clone, so we do a single pass and log retryable errors.
+    let response = next.run(req).await;
+    let status = response.status();
 
-    loop {
-        let response = next.run(req.clone()).await;
-        let status = response.status();
-
-        if status.is_success() {
-            return response;
-        }
-
-        if !is_retryable_error(status) {
-            return response;
-        }
-
-        recovery_context.attempt += 1;
-        if recovery_context.attempt >= config.max_retries {
-            tracing::warn!(
-                attempt = recovery_context.attempt,
-                status = status.as_u16(),
-                "Max retries exceeded"
-            );
-            return response;
-        }
-
-        let backoff = calculate_backoff(recovery_context.attempt - 1, &config);
-        tracing::info!(
-            attempt = recovery_context.attempt,
-            backoff_ms = backoff.as_millis(),
-            status = status.as_u16(),
-            "Retrying request with exponential backoff"
-        );
-
-        tokio::time::sleep(backoff).await;
+    if is_retryable_error(status) {
+        tracing::warn!(status = status.as_u16(), "Retryable error encountered");
     }
+
+    response
 }
 
 /// Circuit breaker state

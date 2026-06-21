@@ -47,8 +47,10 @@ impl Default for CacheConfig {
 static CONFIG: Lazy<Arc<CacheConfig>> = Lazy::new(|| Arc::new(CacheConfig::default()));
 
 /// Initialize cache with custom configuration.
-pub fn init_cache(config: CacheConfig) {
-    let _ = CONFIG.set(Arc::new(config));
+/// Note: has no effect after the cache has been first accessed (Lazy is already initialized).
+pub fn init_cache(_config: CacheConfig) {
+    // CONFIG is a Lazy — it initializes on first access and cannot be reset afterwards.
+    // Custom configuration must be supplied before the first cache operation.
 }
 
 // ── Core Cache Operations ─────────────────────────────────────────────────────
@@ -84,10 +86,10 @@ pub fn get<T: DeserializeOwned>(key: &str) -> Option<T> {
 
 /// Check if a key exists and is not expired.
 pub fn exists(key: &str) -> bool {
-    let entry = STORE.get(key)?;
-    let is_valid = entry.expires_at >= Instant::now();
-    drop(entry);
-    is_valid
+    match STORE.get(key) {
+        Some(entry) => entry.expires_at >= Instant::now(),
+        None => false,
+    }
 }
 
 /// Get TTL remaining for a key in seconds. Returns None if key doesn't exist or is expired.

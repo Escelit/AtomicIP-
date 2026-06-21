@@ -105,7 +105,7 @@ pub async fn request_validation_middleware(
 
     // Validate method
     if !matches!(
-        method,
+        *method,
         axum::http::Method::GET
             | axum::http::Method::POST
             | axum::http::Method::PUT

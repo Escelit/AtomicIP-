@@ -173,8 +173,6 @@ pub enum DataKey {
     BatchMetadata(u64),
     // Issue #457: Encrypted commitment
     EncryptedCommitment(u64),
-    // Issue #456: Compression algorithm selection
-    CompressionSelection(u64),
     // Issue #465: Batch escrow — keyed by escrow_id (sha256 of ip_ids + timestamp)
     BatchEscrow(BytesN<32>),
 }
@@ -4287,7 +4285,7 @@ impl IpRegistry {
     pub fn verify_batch_proof(
         env: Env,
         proof_hash: BytesN<32>,
-    ) -> Option<BatchVerifyProof> {
+    ) -> Option<BatchVerifyResultStorage> {
         env.storage()
             .persistent()
             .get(&DataKey::BatchVerifyResult(proof_hash))
