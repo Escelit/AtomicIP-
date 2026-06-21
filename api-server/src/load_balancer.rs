@@ -92,7 +92,7 @@ impl LoadBalancer {
             .map(|inst| {
                 let request_count = inst.request_count.load(Ordering::SeqCst);
                 let error_count = inst.error_count.load(Ordering::SeqCst);
-                let healthy = error_count == 0 || (request_count > 0 && error_count as f64 / request_count as f64 < 0.1);
+                let healthy = error_count == 0 || (request_count > 0 && error_count as f64 / (request_count as f64) < 0.1);
 
                 InstanceHealth {
                     id: inst.id.clone(),

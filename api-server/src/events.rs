@@ -64,7 +64,7 @@ pub async fn events_handler(
     
     let stream = tokio_stream::wrappers::BroadcastStream::new(receiver)
         .filter_map(|result| match result {
-            Ok(event) => Some(Ok(Event::default().json_data(event).unwrap())),
+            Ok(event) => Some(Ok::<axum::response::sse::Event, std::convert::Infallible>(Event::default().json_data(event).unwrap())),
             Err(_) => None, // Skip lagged messages
         });
 

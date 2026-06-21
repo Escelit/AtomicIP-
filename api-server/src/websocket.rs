@@ -1,3 +1,27 @@
+//! WebSocket event streaming.
+//!
+//! Two WebSocket endpoints are available:
+//!
+//! ## `GET /graphql/ws` — GraphQL subscriptions (`graphql-transport-ws`)
+//!
+//! Standard GraphQL subscription protocol supported by Apollo Client,
+//! `graphql-ws`, urql, etc.  The handler is registered in `main.rs` using
+//! `async_graphql_axum::GraphQLWebSocket` and `GraphQLProtocol`.
+//!
+//! Supported subscriptions and their filters are documented in [`crate::graphql`].
+//!
+//! ## `GET /ws` — Raw JSON WebSocket (legacy)
+//!
+//! A simple pub/sub protocol for IP and swap events.  Clients send JSON
+//! messages with an `"action"` field to subscribe/unsubscribe:
+//!
+//! ```json
+//! { "action": "subscribe_ip_events" }
+//! { "action": "subscribe_swap_events" }
+//! { "action": "unsubscribe_ip_events" }
+//! { "action": "unsubscribe_swap_events" }
+//! ```
+
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -77,18 +101,18 @@ pub async fn handle_socket(socket: WebSocket, broadcaster: Arc<EventBroadcaster>
             msg = receiver.next() => {
                 match msg {
                     Some(Ok(axum::extract::ws::Message::Text(text))) => {
-                        if let Ok(sub_msg) = serde_json::from_str::<SubscriptionMessage>(&text) {
+                        if let Ok(sub_msg) = serde_json::from_str::<SubscriptionMessage>(text.as_str()) {
                             match sub_msg.action.as_str() {
                                 "subscribe_ip_events" => {
                                     subscribed_ip = true;
                                     let _ = sender.send(axum::extract::ws::Message::Text(
-                                        r#"{"status":"subscribed","type":"ip_events"}"#.to_string()
+                                        r#"{"status":"subscribed","type":"ip_events"}"#.into()
                                     )).await;
                                 }
                                 "subscribe_swap_events" => {
                                     subscribed_swap = true;
                                     let _ = sender.send(axum::extract::ws::Message::Text(
-                                        r#"{"status":"subscribed","type":"swap_events"}"#.to_string()
+                                        r#"{"status":"subscribed","type":"swap_events"}"#.into()
                                     )).await;
                                 }
                                 "unsubscribe_ip_events" => {
@@ -110,14 +134,14 @@ pub async fn handle_socket(socket: WebSocket, broadcaster: Arc<EventBroadcaster>
             event = ip_rx.recv(), if subscribed_ip => {
                 if let Ok(event) = event {
                     if let Ok(json) = serde_json::to_string(&event) {
-                        let _ = sender.send(axum::extract::ws::Message::Text(json)).await;
+                        let _ = sender.send(axum::extract::ws::Message::Text(json.into())).await;
                     }
                 }
             }
             event = swap_rx.recv(), if subscribed_swap => {
                 if let Ok(event) = event {
                     if let Ok(json) = serde_json::to_string(&event) {
-                        let _ = sender.send(axum::extract::ws::Message::Text(json)).await;
+                        let _ = sender.send(axum::extract::ws::Message::Text(json.into())).await;
                     }
                 }
             }

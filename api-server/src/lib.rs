@@ -36,10 +36,24 @@
 //! - `X-Public-Key`: Stellar public key
 
 pub mod auth;
+pub mod batch;
 pub mod cache;
+pub mod circuit_breaker;
+pub mod compression;
+pub mod deduplication;
+pub mod distributed_tracing;
+pub mod events;
+pub mod graphql;
 pub mod handlers;
+pub mod health;
+pub mod invariants;
+pub mod load_balancer;
 pub mod metrics;
+pub mod middleware_pipeline;
+pub mod request_signing;
 pub mod schemas;
+pub mod tracing_middleware;
+pub mod versioning;
 pub mod webhook;
 pub mod websocket;
 pub mod graphql;

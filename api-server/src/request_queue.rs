@@ -69,7 +69,7 @@ impl RequestQueue {
         // Try to acquire semaphore permit
         let permit = match tokio::time::timeout(
             self.config.request_timeout,
-            self.semaphore.acquire(),
+            Arc::clone(&self.semaphore).acquire_owned(),
         )
         .await
         {
@@ -139,7 +139,15 @@ pub struct QueueGuard {
     request_id: String,
     queue: Arc<DashMap<String, QueueEntry>>,
     queue_size: Arc<std::sync::atomic::AtomicUsize>,
-    _permit: tokio::sync::SemaphorePermit<'static>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl std::fmt::Debug for QueueGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueueGuard")
+            .field("request_id", &self.request_id)
+            .finish()
+    }
 }
 
 impl Drop for QueueGuard {

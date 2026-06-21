@@ -35,21 +35,10 @@ pub fn compress_gzip(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
 /// Compress data using brotli
 pub fn compress_brotli(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     let mut output = Vec::new();
-    brotli::BrotliEncoderOperation::Finish;
-    match brotli::enc::BrotliEncoderCompress(
-        11,
-        22,
-        brotli::enc::BrotliEncoderMode::default(),
-        data.len(),
-        data,
-        &mut brotli::enc::StandardOut::new(&mut output),
-    ) {
-        Ok(_) => Ok(output),
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Brotli compression failed",
-        )),
-    }
+    let mut writer = brotli::CompressorWriter::new(&mut output, 4096, 11, 22);
+    writer.write_all(data)?;
+    drop(writer);
+    Ok(output)
 }
 
 /// Middleware to handle Accept-Encoding header and apply compression

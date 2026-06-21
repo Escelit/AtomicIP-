@@ -36,7 +36,9 @@ pub async fn deduplication_middleware(
     let store = req.extensions().get::<DeduplicationStore>().unwrap().clone();
     
     // Check for existing result
-    if let Some((cached_result, timestamp)) = store.get(idempotency_key) {
+    if let Some(entry) = store.get(idempotency_key) {
+        let cached_result: &serde_json::Value = &entry.0;
+        let timestamp: &tokio::time::Instant = &entry.1;
         // Return cached result if within TTL (1 hour)
         if timestamp.elapsed() < Duration::from_secs(3600) {
             let response = Response::builder()
@@ -52,24 +54,27 @@ pub async fn deduplication_middleware(
     }
 
     let response = next.run(req).await;
-    
+
     // Cache successful responses
     if response.status().is_success() {
+        let status = response.status();
         if let Ok(body_bytes) = axum::body::to_bytes(response.into_body(), usize::MAX).await {
             if let Ok(json_value) = serde_json::from_slice::<Value>(&body_bytes) {
                 store.insert(idempotency_key.to_string(), (json_value.clone(), Instant::now()));
-                
+
                 let new_response = Response::builder()
-                    .status(response.status())
+                    .status(status)
                     .header("content-type", "application/json")
                     .body(body_bytes.into())
                     .unwrap();
                 return Ok(new_response);
             }
         }
+    } else {
+        return Ok(response);
     }
 
-    Ok(response)
+    Ok(Response::default())
 }
 
 /// Concurrent request deduplication - prevents duplicate concurrent requests
@@ -117,19 +122,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_deduplication_requires_idempotency_key() {
-        let store = create_store();
+        use axum::{middleware, routing::post, Router};
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/test", post(|| async { "ok" }))
+            .layer(middleware::from_fn(deduplication_middleware));
+
         let req = Request::builder()
             .method("POST")
             .uri("/test")
             .body(Body::empty())
             .unwrap();
-        
-        let next = |_: Request| async { 
-            Response::builder().status(200).body(Body::empty()).unwrap()
-        };
-        
-        let result = deduplication_middleware(HeaderMap::new(), req, next).await;
-        assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

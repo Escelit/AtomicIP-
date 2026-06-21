@@ -78,10 +78,6 @@ pub struct CursorPaginationParams {
     pub cursor: Option<String>,
 }
 
-fn default_limit() -> u64 {
-    50
-}
-
 /// Response type for cursor-paginated list endpoints.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct PaginatedResponse<T> {
@@ -134,6 +130,7 @@ pub mod cursor {
 #[cfg(test)]
 mod cursor_tests {
     use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     #[test]
     fn test_cursor_encode_decode_roundtrip() {
