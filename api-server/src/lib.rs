@@ -36,6 +36,7 @@
 //! - `X-Public-Key`: Stellar public key
 
 pub mod auth;
+pub mod audit;
 pub mod batch;
 pub mod cache;
 pub mod circuit_breaker;
