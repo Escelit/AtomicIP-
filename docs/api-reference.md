@@ -936,3 +936,162 @@ client.assign_ip_to_category(&ip_id, &cat_hash);
 let ids = client.list_ip_by_category(&owner, &cat_hash);
 let cats = client.list_owner_categories(&owner);
 ```
+
+---
+
+## Input Validation Framework
+
+All REST and GraphQL endpoints enforce comprehensive input validation to prevent injection attacks and ensure data consistency.
+
+### Validation Principles
+
+1. **OWASP Top 10 Compliance**: Protection against injection, XSS, and path traversal attacks
+2. **Length Limits**: All strings limited to 10,000 characters; arrays to 1,000 items; addresses/URLs to 512 characters
+3. **Null Byte Prevention**: Automatic detection and rejection of null byte injection (severity: HIGH)
+4. **Type Safety**: Strong validation of data types and formats
+5. **Composable Rules**: ValidationRules trait enables flexible, chainable validators
+
+### Validation Error Response Format
+
+All validation failures return HTTP 400 (Bad Request) with a standardized error response:
+
+```json
+{
+  "error": "Request validation failed",
+  "details": [
+    {
+      "field": "address",
+      "message": "Invalid Stellar address format",
+      "severity": "High"
+    }
+  ],
+  "timestamp": "2024-01-15T10:30:45Z"
+}
+```
+
+### Error Severity Levels
+
+| Severity | Meaning | Action |
+|---|---|---|
+| `High` | Security or critical correctness issue | Request rejected immediately |
+| `Medium` | Data quality issue | Request rejected, user should correct input |
+| `Low` | Minor issue | Request rejected, typically informational |
+
+### Field Validation Rules
+
+#### Stellar Address (`address`)
+- **Format**: Exactly 56 characters, starts with 'G'
+- **Allowed Characters**: Base32 alphanumeric
+- **Max Length**: 512 characters
+- **Injection Protection**: Null bytes rejected
+- **Examples**:
+  - ✓ `GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3UFOCHJEAZD`
+  - ✗ `INVALID` (too short)
+  - ✗ `0BRPYHIL...` (wrong first character)
+
+#### Commitment Hash (`commitment_hash`, `hash`)
+- **Format**: Hex-encoded 32-byte value (64 hex characters)
+- **Allowed Characters**: 0-9, a-f, A-F
+- **Max Length**: 10,000 characters
+- **Examples**:
+  - ✓ `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`
+  - ✗ `e3b0c442` (too short)
+  - ✗ `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85g` (invalid hex)
+
+#### Amount (`amount`, `price`, `balance`)
+- **Type**: Positive 64-bit integer (>0)
+- **Range**: 1 to 2^63 - 1
+- **Examples**:
+  - ✓ `1000`
+  - ✗ `0` (must be positive)
+  - ✗ `-100` (negative)
+
+#### Timestamp (`timestamp`, `created_at`, `expires_at`)
+- **Type**: Unix timestamp (seconds since epoch)
+- **Valid Range**: 2000-01-01 to 2100-01-01
+- **Examples**:
+  - ✓ `1672531200` (2023-01-01)
+  - ✗ `100` (too early)
+  - ✗ `9999999999` (too far in future)
+
+#### URL (`webhook_url`)
+- **Format**: Must start with `http://` or `https://`
+- **Max Length**: 512 characters
+- **Injection Protection**: Null bytes rejected
+- **Examples**:
+  - ✓ `https://example.com/webhook`
+  - ✗ `ftp://example.com` (unsupported protocol)
+  - ✗ `example.com` (missing protocol)
+
+#### Array Length (`ip_ids`, `prices`, `buyers`)
+- **Min Length**: 1 item (cannot be empty)
+- **Max Length**: 1,000 items
+- **Validation**: No duplicate items allowed
+
+#### String (`owner_name`, `description`)
+- **Min Length**: 1 character (non-empty)
+- **Max Length**: 10,000 characters
+- **Injection Protection**: Null bytes rejected
+
+### Composable Validation Example
+
+Create custom validation rules by combining built-in validators:
+
+```rust
+use crate::validation::{
+    ValidationRules, AddressValidationRule, AmountValidationRule,
+};
+
+let address_rule = AddressValidationRule {
+    address: user_address.to_string(),
+    field_name: "owner".to_string(),
+};
+
+let amount_rule = AmountValidationRule {
+    amount: price,
+    field_name: "price".to_string(),
+};
+
+// Chain rules together
+let combined = address_rule.chain(Box::new(amount_rule));
+match combined.validate() {
+    Ok(_) => { /* proceed */ },
+    Err(errors) => { /* handle errors */ },
+}
+```
+
+### GraphQL Validation
+
+GraphQL requests validate input at the resolver level. All scalar inputs use the same validation rules as REST endpoints.
+
+Example mutation with validation:
+
+```graphql
+mutation {
+  commitIp(input: {
+    owner: "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBQ5ECVVF7C3UFOCHJEAZD"
+    commitmentHash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }) {
+    ipId
+    status
+  }
+}
+```
+
+### Security Considerations
+
+1. **Null Byte Injection**: All string fields are checked for `\0` characters (OWASP injection prevention)
+2. **Length Limits**: Prevents DoS attacks via excessively large payloads
+3. **Type Coercion**: No automatic type conversion; strict type checking required
+4. **Array Bounds**: Prevents memory exhaustion via large batch operations
+5. **Timestamp Bounds**: Prevents logic errors from unrealistic timestamps
+
+### Validation Middleware
+
+A request-level middleware enforces validation before handlers execute:
+
+```rust
+.layer(middleware::from_fn(validation_middleware::validation_logging_middleware))
+```
+
+All validation failures are logged for monitoring and audit purposes.

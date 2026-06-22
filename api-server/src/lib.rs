@@ -66,3 +66,5 @@ pub mod compression;
 pub mod load_balancer;
 pub mod middleware_pipeline;
 pub mod dependency_injection;
+pub mod validation;
+pub mod validation_middleware;

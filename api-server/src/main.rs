@@ -47,6 +47,10 @@ mod distributed_tracing;
 mod error_recovery;
 mod otel;
 mod request_queue;
+mod validation;
+mod validation_middleware;
+#[cfg(test)]
+mod validation_fuzz_tests;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -265,6 +269,7 @@ fn build_app() -> Router {
         .layer(middleware::from_fn(tracing_middleware::trace_requests))
         .layer(middleware::from_fn(versioning::version_negotiation))
         .layer(middleware::from_fn(compression::compression_middleware))
+        .layer(middleware::from_fn(validation_middleware::validation_logging_middleware))
         .layer(middleware::from_fn(require_json_content_type))
 }
 
